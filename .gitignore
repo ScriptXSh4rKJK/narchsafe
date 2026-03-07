@@ -1,0 +1,4 @@
+narchsafe
+src/*.o
+src/*.d
+*.tar.gz

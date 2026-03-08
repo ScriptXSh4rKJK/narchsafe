@@ -11,12 +11,15 @@ int lock_acquire(void) {
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
-            // Another instance is running; read its PID for a useful message
             char pidbuf[32] = {0};
-            if (read(fd, pidbuf, sizeof(pidbuf) - 1) > 0)
+            ssize_t r = read(fd, pidbuf, sizeof(pidbuf) - 1);
+            if (r > 0) {
+                pidbuf[r] = '\0';
+                char *nl = strchr(pidbuf, '\n'); if (nl) *nl = '\0';
                 LOGE("Another instance is already running (PID %s)", pidbuf);
-            else
+            } else {
                 LOGE("Another instance is already running");
+            }
         } else {
             LOGE("flock: %s", strerror(errno));
         }
@@ -32,10 +35,13 @@ int lock_acquire(void) {
 
     char pidbuf[32];
     int n = snprintf(pidbuf, sizeof(pidbuf), "%lld\n", (long long)getpid());
-    if (n > 0 && write(fd, pidbuf, (size_t)n) != (ssize_t)n) {
-        LOGE("Failed to write PID: %s", strerror(errno));
-        close(fd);
-        return -1;
+    if (n > 0) {
+        if (write(fd, pidbuf, (size_t)n) != (ssize_t)n) {
+            LOGE("Failed to write PID: %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        (void)fsync(fd);   /* ensure PID is visible to other instances */
     }
 
     return fd;

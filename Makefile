@@ -1,8 +1,12 @@
 CC      ?= gcc
-CFLAGS   = -std=c11 -Wall -Wextra -Wpedantic -O2 \
+CFLAGS   = -std=c11 -Wall -Wextra -Wpedantic \
+           -Wformat=2 -Wformat-security -Wshadow -Wstrict-prototypes \
+           -Wdouble-promotion -Wnull-dereference \
+           -O2 \
+           -fstack-protector-strong -fPIE \
            -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE \
            -Iinclude
-LDFLAGS  =
+LDFLAGS  = -pie -Wl,-z,relro,-z,now,-z,noexecstack
 
 TARGET   = narchsafe
 

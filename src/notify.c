@@ -1,6 +1,7 @@
 #include "notify.h"
 #include "cfg.h"
 #include "log.h"
+#include "proc.h"
 
 static void _notify_libnotify(const char *title, const char *body, const char *icon) {
     if (access(NOTIFY_SEND_BIN, X_OK) != 0) {
@@ -12,12 +13,19 @@ static void _notify_libnotify(const char *title, const char *body, const char *i
     if (pid < 0) { LOGW("fork for notify-send: %s", strerror(errno)); return; }
     if (pid == 0) {
         signal(SIGINT, SIG_DFL);
-        if (icon && icon[0])
-            execlp(NOTIFY_SEND_BIN, NOTIFY_SEND_BIN,
-                   "--app-name=" PROG_NAME, "-i", icon, "--", title, body, NULL);
-        else
-            execlp(NOTIFY_SEND_BIN, NOTIFY_SEND_BIN,
-                   "--app-name=" PROG_NAME, "--", title, body, NULL);
+        /* Use execve with hardcoded path — never rely on PATH search */
+        if (icon && icon[0]) {
+            char *av[] = { NOTIFY_SEND_BIN,
+                           "--app-name=" PROG_NAME,
+                           "-i", (char *)icon,
+                           "--", (char *)title, (char *)body, NULL };
+            execve(NOTIFY_SEND_BIN, av, SAFE_ENV);
+        } else {
+            char *av[] = { NOTIFY_SEND_BIN,
+                           "--app-name=" PROG_NAME,
+                           "--", (char *)title, (char *)body, NULL };
+            execve(NOTIFY_SEND_BIN, av, SAFE_ENV);
+        }
         _exit(1);
     }
     int status;
@@ -59,22 +67,45 @@ static void _notify_telegram(const char *title, const char *body) {
     snprintf(url, sizeof(url), "%s/bot%s/sendMessage",
              g_cfg.telegram_api_url, g_cfg.telegram_token);
 
-    char postdata[2048];
-    snprintf(postdata, sizeof(postdata),
-             "chat_id=%s&parse_mode=HTML&text=%s",
-             g_cfg.telegram_chat_id, msg);
-
     LOGI("Sending Telegram notification");
 
+    /* Pass each field separately so curl handles URL-encoding correctly.
+     * Never concatenate chat_id or msg into a single --data-urlencode arg —
+     * that is an injection vector if either field contains special characters. */
     pid_t pid = fork();
     if (pid < 0) { LOGW("fork for curl: %s", strerror(errno)); return; }
     if (pid == 0) {
         signal(SIGINT, SIG_DFL);
-        // Suppress curl output — we only care about the exit code
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); dup2(devnull, STDERR_FILENO); close(devnull); }
-        execlp(CURL_BIN, CURL_BIN, "-sS", "--max-time", "10",
-               "-X", "POST", url, "--data-urlencode", postdata, NULL);
+        int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            /* devnull fd closed by O_CLOEXEC on exec */
+        }
+
+        /*
+         * For --data-urlencode the correct form is:
+         *   --data-urlencode "name=value"   → curl encodes only 'value'
+         * We build each param string separately so no field value can
+         * escape into the key name (injection prevention).
+         */
+        char chat_id_arg[128];
+        snprintf(chat_id_arg, sizeof(chat_id_arg),
+                 "chat_id=%s", g_cfg.telegram_chat_id);
+
+        /* msg already has HTML escaping applied */
+        char text_arg[1600];
+        snprintf(text_arg, sizeof(text_arg), "text=%s", msg);
+
+        char *av[] = {
+            CURL_BIN, "-sS", "--max-time", "10",
+            "-X", "POST", (char *)url,
+            "--data-urlencode", chat_id_arg,
+            "--data-urlencode", "parse_mode=HTML",
+            "--data-urlencode", text_arg,
+            NULL
+        };
+        execve(CURL_BIN, av, SAFE_ENV);
         _exit(1);
     }
     int status;

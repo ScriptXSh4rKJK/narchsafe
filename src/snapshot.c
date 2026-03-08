@@ -5,11 +5,11 @@
 FsType detect_root_fs(void) {
     FILE *fp = fopen("/proc/mounts", "r");
     if (!fp) return FS_OTHER;
-    char line[512];
+    char line[1024];   /* increased: device paths can be long */
     FsType result = FS_OTHER;
     while (fgets(line, (int)sizeof(line), fp)) {
-        char dev[256], mnt[256], fstype[64];
-        if (sscanf(line, "%255s %255s %63s", dev, mnt, fstype) != 3) continue;
+        char dev[512], mnt[256], fstype[64];
+        if (sscanf(line, "%511s %255s %63s", dev, mnt, fstype) != 3) continue;
         if (strcmp(mnt, "/") != 0) continue;
         if (strcmp(fstype, "btrfs") == 0) { result = FS_BTRFS; break; }
         if (strcmp(fstype, "zfs")   == 0) { result = FS_ZFS;   break; }
@@ -21,11 +21,11 @@ FsType detect_root_fs(void) {
 int get_zfs_root_dataset(char *buf, size_t size) {
     FILE *fp = fopen("/proc/mounts", "r");
     if (!fp) return -1;
-    char line[512];
+    char line[1024];
     int found = 0;
     while (fgets(line, (int)sizeof(line), fp)) {
-        char dev[256], mnt[256], fstype[64];
-        if (sscanf(line, "%255s %255s %63s", dev, mnt, fstype) != 3) continue;
+        char dev[512], mnt[256], fstype[64];
+        if (sscanf(line, "%511s %255s %63s", dev, mnt, fstype) != 3) continue;
         if (strcmp(mnt, "/") != 0 || strcmp(fstype, "zfs") != 0) continue;
         int n = snprintf(buf, size, "%s", dev);
         if (n > 0 && (size_t)n < size) found = 1;

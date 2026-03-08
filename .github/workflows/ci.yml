@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-gcc:
+    name: Build (GCC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y gcc make
+
+      - name: Build
+        run: make CC=gcc
+
+      - name: Smoke test
+        run: |
+          ./narchsafe --version
+          ./narchsafe --help
+          ./narchsafe --dry-run
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: narchsafe-gcc-${{ github.sha }}
+          path: narchsafe
+
+  build-clang:
+    name: Build (Clang)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y clang make
+
+      - name: Build
+        run: make CC=clang
+
+      - name: Smoke test
+        run: |
+          ./narchsafe --version
+          ./narchsafe --dry-run
+
+  lint:
+    name: Lint (cppcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck
+        run: |
+          cppcheck \
+            --enable=all \
+            --error-exitcode=1 \
+            --std=c11 \
+            --suppress=missingIncludeSystem \
+            --suppress=checkersReport \
+            -Iinclude \
+            src/
+
+  release:
+    name: Release tarball
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-gcc, build-clang, lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y gcc make
+
+      - name: Build
+        run: make CC=gcc
+
+      - name: Create tarball
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          tar -cJf narchsafe-${VERSION}.tar.xz \
+            --transform "s|^|narchsafe-${VERSION}/|" \
+            Makefile LICENSE README.md CHANGELOG.md CONTRIBUTING.md \
+            include/ src/ etc/
+          sha256sum narchsafe-${VERSION}.tar.xz > narchsafe-${VERSION}.tar.xz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            narchsafe-*.tar.xz
+            narchsafe-*.tar.xz.sha256
+          generate_release_notes: true

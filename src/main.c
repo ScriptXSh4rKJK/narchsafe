@@ -75,6 +75,9 @@ static int run_update(int auto_rollback, int do_snapshot) {
         cfg_print();
     }
 
+    /* Root check is already done in main() before lock is acquired.
+     * We keep a defensive check here only for the non-dry-run path
+     * in case run_update() is ever called directly in future. */
     if (geteuid() != 0 && !g_dry_run) {
         fprintf(stderr, "Root privileges required.\n");
         return EXIT_ERR_PERM;
@@ -210,10 +213,14 @@ int main(int argc, char *argv[]) {
     if (mode_rollback) {
         LOGI("Mode: rollback");
         if (rollback_dir[0] != '\0') {
-            if (access(rollback_dir, F_OK) != 0) {
-                LOGE("Backup directory not found: %s", rollback_dir);
+            /* Validate directory existence without TOCTOU — open and stat */
+            int dfd = open(rollback_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (dfd < 0) {
+                LOGE("Backup directory not found: %s: %s",
+                     rollback_dir, strerror(errno));
                 return EXIT_ERR_GENERIC;
             }
+            close(dfd);
             rc = do_rollback(rollback_dir);
         } else {
             rc = rollback_from_last();

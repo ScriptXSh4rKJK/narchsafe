@@ -1,4 +1,20 @@
+# Build artifacts
 narchsafe
+narch-rollback
 src/*.o
 src/*.d
+
+# Release archives
+*.tar.xz
 *.tar.gz
+*.sha256
+
+# Editor temp files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# clangd / LSP
+compile_commands.json
+.cache/

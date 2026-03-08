@@ -54,11 +54,13 @@ int run_to_file(const char *path, char *const argv[], const char *outpath) {
     pid_t pid = fork();
     if (pid < 0) { LOGE("fork: %s", strerror(errno)); return -1; }
     if (pid == 0) {
-        child_init();
         int fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (fd < 0) _exit(1);
         if (dup2(fd, STDOUT_FILENO) < 0) _exit(1);
-        close(fd);
+        /* Redirect stderr to /dev/null to avoid polluting the terminal */
+        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (devnull >= 0) dup2(devnull, STDERR_FILENO);
+        child_init();   /* called after dup2; O_CLOEXEC closes fd/devnull on exec */
         execve(path, argv, SAFE_ENV);
         _exit(127);
     }
@@ -68,7 +70,7 @@ int run_to_file(const char *path, char *const argv[], const char *outpath) {
 int run_tee(const char *path, char *const argv[], FILE *logfp) {
     if (access(path, X_OK) != 0) { LOGE("%s: not found", path); return -1; }
     int pfd[2];
-    if (pipe(pfd) != 0) { LOGE("pipe: %s", strerror(errno)); return -1; }
+    if (pipe2(pfd, O_CLOEXEC) != 0) { LOGE("pipe2: %s", strerror(errno)); return -1; }
     pid_t pid = fork();
     if (pid < 0) {
         close(pfd[0]); close(pfd[1]);
@@ -76,11 +78,10 @@ int run_tee(const char *path, char *const argv[], FILE *logfp) {
         return -1;
     }
     if (pid == 0) {
-        close(pfd[0]);
+        /* dup2 clears O_CLOEXEC on the target fd — intentional */
         if (dup2(pfd[1], STDOUT_FILENO) < 0) _exit(1);
         if (dup2(pfd[1], STDERR_FILENO) < 0) _exit(1);
-        close(pfd[1]);
-        child_init();
+        child_init();   /* called after dup2; O_CLOEXEC closes pfd[0/1] on exec */
         execve(path, argv, SAFE_ENV);
         _exit(127);
     }
@@ -101,7 +102,7 @@ int run_capture(const char *path, char *const argv[], char *buf, size_t bufsz) {
     buf[0] = '\0';
     if (access(path, X_OK) != 0) { LOGE("%s: not found", path); return -1; }
     int pfd[2];
-    if (pipe(pfd) != 0) { LOGE("pipe: %s", strerror(errno)); return -1; }
+    if (pipe2(pfd, O_CLOEXEC) != 0) { LOGE("pipe2: %s", strerror(errno)); return -1; }
     pid_t pid = fork();
     if (pid < 0) {
         close(pfd[0]); close(pfd[1]);
@@ -109,22 +110,20 @@ int run_capture(const char *path, char *const argv[], char *buf, size_t bufsz) {
         return -1;
     }
     if (pid == 0) {
-        close(pfd[0]);
         if (dup2(pfd[1], STDOUT_FILENO) < 0) _exit(1);
-        int devnull = open("/dev/null", O_WRONLY);
+        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
         if (devnull >= 0) dup2(devnull, STDERR_FILENO);
-        close(pfd[1]);
-        child_init();
+        child_init();   /* called after dup2; O_CLOEXEC closes pfd[0/1] on exec */
         execve(path, argv, SAFE_ENV);
         _exit(127);
     }
     close(pfd[1]);
     size_t total = 0;
     ssize_t n;
-    while ((n = read(pfd[0], buf + total, bufsz - 1 - total)) > 0)
+    while (total < bufsz - 1 &&
+           (n = read(pfd[0], buf + total, bufsz - 1 - total)) > 0)
         total += (size_t)n;
     buf[total] = '\0';
-    // Drop trailing newline so callers can use the string directly
     if (total > 0 && buf[total - 1] == '\n') buf[--total] = '\0';
     close(pfd[0]);
     return wait_child(pid, path);

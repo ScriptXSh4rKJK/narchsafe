@@ -1,0 +1,1917 @@
+// ===== FILE: ./backup.c =====
+#include "backup.h"
+#include "cfg.h"
+#include "log.h"
+#include "proc.h"
+#include "utils.h"
+
+int create_backup_dir(const char *dir) {
+    char *argv[] = { MKDIR_BIN, "-p", g_cfg.backup_base, NULL };
+    if (run_mut(MKDIR_BIN, argv) != 0) {
+        LOGE("Failed to create base dir: %s", g_cfg.backup_base);
+        return -1;
+    }
+    if (!g_dry_run) chmod(g_cfg.backup_base, 0700);
+    if (g_dry_run) {
+        printf("  [DRY-RUN] would mkdir: %s\n", dir);
+        return 0;
+    }
+    if (mkdir(dir, 0700) != 0) {
+        LOGE("mkdir(%s): %s", dir, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int backup_package_list(const char *dir) {
+    char outfile[PATH_MAX];
+    int on = snprintf(outfile, sizeof(outfile), "%s/packages.txt", dir);
+    if (on < 0 || (size_t)on >= sizeof(outfile)) return -1;
+    if (g_dry_run) {
+        printf("  [DRY-RUN] would save: pacman -Qqe -> %s\n", outfile);
+        return 0;
+    }
+    char *argv[] = { PACMAN_BIN, "-Qqe", NULL };
+    if (run_to_file(PACMAN_BIN, argv, outfile) != 0) {
+        LOGE("Failed to save package list");
+        return -1;
+    }
+    int fd = open(outfile, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { fsync(fd); close(fd); }
+    return 0;
+}
+
+int backup_versions(const char *dir) {
+    char outfile[PATH_MAX];
+    int on = snprintf(outfile, sizeof(outfile), "%s/%s", dir, VERSIONS_BEFORE);
+    if (on < 0 || (size_t)on >= sizeof(outfile)) return -1;
+    if (g_dry_run) {
+        printf("  [DRY-RUN] would save: pacman -Q -> %s\n", outfile);
+        return 0;
+    }
+    char *argv[] = { PACMAN_BIN, "-Q", NULL };
+    if (run_to_file(PACMAN_BIN, argv, outfile) != 0) {
+        LOGE("Failed to save package versions");
+        return -1;
+    }
+    int fd = open(outfile, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { fsync(fd); close(fd); }
+    return 0;
+}
+
+static int backup_boot_cp(const char *dir) {
+    char boot_dest[PATH_MAX];
+    int bn = snprintf(boot_dest, sizeof(boot_dest), "%s/boot", dir);
+    if (bn < 0 || (size_t)bn >= sizeof(boot_dest)) return -1;
+    char *argv[] = { CP_BIN, "-a", "/boot", (char *)boot_dest, NULL };
+    if (run_mut(CP_BIN, argv) != 0) { LOGE("Failed to copy /boot"); return -1; }
+    LOGI("/boot copied to %s/boot", dir);
+    return 0;
+}
+
+static int backup_boot_tar(const char *dir) {
+    if (access(TAR_BIN, X_OK) != 0) { LOGE("tar not found: %s", TAR_BIN); return -1; }
+    char archive[PATH_MAX];
+    int an = snprintf(archive, sizeof(archive), "%s/%s", dir, BOOT_BACKUP_NAME);
+    if (an < 0 || (size_t)an >= sizeof(archive)) return -1;
+    if (g_dry_run) {
+        printf("  [DRY-RUN] would run: tar -cpzf %s /boot\n", archive);
+        return 0;
+    }
+    char *argv[] = { TAR_BIN, "-cpzf", (char *)archive, "--warning=no-file-changed", "/boot", NULL };
+    int ret = run(TAR_BIN, argv);
+    if (ret != 0 && ret != 1) { LOGE("tar /boot returned %d", ret); return -1; }
+    LOGI("/boot archived to %s", archive);
+    return 0;
+}
+
+int backup_boot(const char *dir) {
+    unsigned long long avail = free_bytes(g_cfg.backup_base);
+    if (!g_dry_run && avail < g_cfg.min_free_bytes) {
+        LOGE("Insufficient disk space: %.1f MB available, %.1f MB required",
+             (double)avail                / (1024.0 * 1024.0),
+             (double)g_cfg.min_free_bytes / (1024.0 * 1024.0));
+        return -1;
+    }
+    return g_cfg.boot_compress ? backup_boot_tar(dir) : backup_boot_cp(dir);
+}
+
+int backup_etc(const char *dir) {
+    if (access(TAR_BIN, X_OK) != 0) {
+        LOGW("tar not found at %s, skipping /etc backup", TAR_BIN);
+        return 0;
+    }
+    char archive[PATH_MAX];
+    int an = snprintf(archive, sizeof(archive), "%s/%s", dir, ETC_BACKUP_NAME);
+    if (an < 0 || (size_t)an >= sizeof(archive)) return -1;
+    if (g_dry_run) {
+        printf("  [DRY-RUN] would run: tar -cpzf %s /etc\n", archive);
+        return 0;
+    }
+    char *argv[] = {
+        TAR_BIN, "-cpzf", (char *)archive,
+        "--exclude=/etc/mtab", "--exclude=/etc/.updated",
+        "--warning=no-file-changed", "/etc", NULL
+    };
+    int ret = run(TAR_BIN, argv);
+    if (ret != 0 && ret != 1) LOGW("tar /etc returned %d (non-fatal)", ret);
+    else                       LOGI("/etc archived to %s", archive);
+    return 0;
+}
+
+int backup_pacman_db(const char *dir) {
+    char db_dest[PATH_MAX];
+    int bn = snprintf(db_dest, sizeof(db_dest), "%s/%s", dir, PACMAN_DB_BACKUP);
+    if (bn < 0 || (size_t)bn >= sizeof(db_dest)) return -1;
+    char *argv[] = { CP_BIN, "-a", PACMAN_LOCAL_DB, (char *)db_dest, NULL };
+    if (run_mut(CP_BIN, argv) != 0) {
+        LOGW("Failed to copy pacman local DB, continuing");
+        return 0;
+    }
+    LOGI("Pacman DB saved to %s", db_dest);
+    return 0;
+}
+
+typedef struct { char name[128]; char ver[128]; } PkgPair;
+
+static int find_in_cache(const char *name, const char *ver, char *out, size_t outsz) {
+    char prefix[260];
+    int pn = snprintf(prefix, sizeof(prefix), "%s-%s-", name, ver);
+    if (pn < 0 || (size_t)pn >= sizeof(prefix)) return -1;
+    size_t prelen = strlen(prefix);
+    DIR *d = opendir(g_cfg.pacman_cache);
+    if (!d) return -1;
+    int found = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && !found) {
+        if (strncmp(ent->d_name, prefix, prelen) != 0) continue;
+        if (!strstr(ent->d_name, ".pkg.tar.")) continue;
+        int n = snprintf(out, outsz, "%s/%s", g_cfg.pacman_cache, ent->d_name);
+        if (n > 0 && (size_t)n < outsz) found = 1;
+    }
+    closedir(d);
+    return found ? 0 : -1;
+}
+
+void check_cache_integrity(const char *backup_dir) {
+    if (g_dry_run) { printf("  [DRY-RUN] would check cache integrity\n"); return; }
+    char verfile[PATH_MAX];
+    int vn = snprintf(verfile, sizeof(verfile), "%s/%s", backup_dir, VERSIONS_BEFORE);
+    if (vn < 0 || (size_t)vn >= sizeof(verfile)) return;
+    FILE *fp = fopen(verfile, "r");
+    if (!fp) return;
+
+    PkgPair *pkgs = calloc((size_t)MAX_PACKAGES, sizeof(PkgPair));
+    if (!pkgs) { fclose(fp); return; }
+    int npkgs = 0;
+    char line[256];
+    while (fgets(line, (int)sizeof(line), fp) && npkgs < MAX_PACKAGES) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        if (sscanf(line, "%127s %127s", pkgs[npkgs].name, pkgs[npkgs].ver) == 2)
+            npkgs++;
+    }
+    fclose(fp);
+
+    int missing = 0;
+    char dummy[PATH_MAX];
+    printf("\n-- Package cache check --\n");
+    for (int i = 0; i < npkgs; i++) {
+        if (find_in_cache(pkgs[i].name, pkgs[i].ver, dummy, sizeof(dummy)) != 0) {
+            // Warn once with a header before listing the first missing package
+            if (missing == 0)
+                printf("Packages missing from cache (auto-rollback unavailable for these):\n");
+            printf("  ! %-30s %s\n", pkgs[i].name, pkgs[i].ver);
+            LOGW("Not in cache: %s %s", pkgs[i].name, pkgs[i].ver);
+            missing++;
+        }
+    }
+    if (missing == 0)
+        printf("All %d packages present in cache.\n", npkgs);
+    else
+        printf("\nMissing: %d package(s). Manual rollback will require re-downloading.\n", missing);
+    free(pkgs);
+}
+
+int do_full_backup(const char *backup_dir) {
+    printf("\n[1/5] Saving package list...\n");
+    if (backup_package_list(backup_dir) != 0) return -1;
+
+    printf("[2/5] Saving package versions...\n");
+    if (backup_versions(backup_dir) != 0) return -1;
+
+    printf("[3/5] Backing up /boot (%s)...\n",
+           g_cfg.boot_compress ? "tar.gz" : "cp -a");
+    if (backup_boot(backup_dir) != 0) return -1;
+
+    printf("[4/5] Archiving /etc...\n");
+    backup_etc(backup_dir);
+
+    printf("[5/5] Saving pacman database...\n");
+    backup_pacman_db(backup_dir);
+
+    check_cache_integrity(backup_dir);
+    return 0;
+}
+
+// ===== FILE: ./cfg.c =====
+#include "cfg.h"
+#include "log.h"
+
+NarchsafeConfig g_cfg;
+
+static void trim_inplace(char *s) {
+    char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    size_t len = strlen(s);
+    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' ||
+                       s[len-1] == '\r' || s[len-1] == '\n'))
+        s[--len] = '\0';
+}
+
+static void strip_inline_comment(char *s) {
+    int in_val = 0;
+    for (char *p = s; *p; p++) {
+        if (!in_val && (*p == ' ' || *p == '\t')) continue;
+        in_val = 1;
+        if (*p == '#' || *p == ';') { *p = '\0'; break; }
+    }
+    trim_inplace(s);
+}
+
+static int parse_bool(const char *s) {
+    if (!s) return -1;
+    if (strcmp(s,"1")==0 || strcasecmp(s,"yes")==0  ||
+        strcasecmp(s,"true")==0 || strcasecmp(s,"on")==0)  return 1;
+    if (strcmp(s,"0")==0 || strcasecmp(s,"no")==0   ||
+        strcasecmp(s,"false")==0 || strcasecmp(s,"off")==0) return 0;
+    return -1;
+}
+
+void cfg_load_defaults(void) {
+    memset(&g_cfg, 0, sizeof(g_cfg));
+    snprintf(g_cfg.backup_base,      sizeof(g_cfg.backup_base),      "%s", DEFAULT_BACKUP_BASE);
+    snprintf(g_cfg.pacman_cache,     sizeof(g_cfg.pacman_cache),     "%s", DEFAULT_PACMAN_CACHE);
+    snprintf(g_cfg.log_file,         sizeof(g_cfg.log_file),         "%s", DEFAULT_LOG_FILE);
+    snprintf(g_cfg.lock_file,        sizeof(g_cfg.lock_file),        "%s", DEFAULT_LOCK_FILE);
+    snprintf(g_cfg.telegram_api_url, sizeof(g_cfg.telegram_api_url), "%s", DEFAULT_TELEGRAM_API_URL);
+
+    g_cfg.keep_count        = DEFAULT_BACKUP_KEEP_COUNT;
+    g_cfg.boot_compress     = DEFAULT_BOOT_COMPRESS;
+    g_cfg.min_free_bytes    = (unsigned long long)DEFAULT_MIN_FREE_MB * 1024ULL * 1024ULL;
+    g_cfg.kernel_fresh_secs = DEFAULT_KERNEL_FRESH_SECS;
+    g_cfg.auto_rollback     = DEFAULT_AUTO_ROLLBACK;
+    g_cfg.do_snapshot       = DEFAULT_DO_SNAPSHOT;
+    g_cfg.notify_libnotify  = DEFAULT_NOTIFY_LIBNOTIFY;
+    g_cfg.notify_telegram   = DEFAULT_NOTIFY_TELEGRAM;
+}
+
+int cfg_parse_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        // Config is optional; missing file is not an error
+        LOGI("No config file at %s, using defaults", path);
+        return -1;
+    }
+    LOGI("Loading config: %s", path);
+
+    char line[512];
+    int  lineno = 0;
+
+    while (fgets(line, (int)sizeof(line), f)) {
+        lineno++;
+        trim_inplace(line);
+
+        if (line[0] == '\0' || line[0] == '#' || line[0] == ';') continue;
+
+        char *eq = strchr(line, '=');
+        if (!eq) {
+            LOGW("%s:%d: missing '=', skipping line", path, lineno);
+            continue;
+        }
+        *eq = '\0';
+        char *key = line;
+        char *val = eq + 1;
+        trim_inplace(key);
+        trim_inplace(val);
+        strip_inline_comment(val);
+
+        // String keys
+        if      (strcmp(key, "backup_base")      == 0) snprintf(g_cfg.backup_base,      sizeof(g_cfg.backup_base),      "%s", val);
+        else if (strcmp(key, "pacman_cache")     == 0) snprintf(g_cfg.pacman_cache,     sizeof(g_cfg.pacman_cache),     "%s", val);
+        else if (strcmp(key, "log_file")         == 0) snprintf(g_cfg.log_file,         sizeof(g_cfg.log_file),         "%s", val);
+        else if (strcmp(key, "lock_file")        == 0) snprintf(g_cfg.lock_file,        sizeof(g_cfg.lock_file),        "%s", val);
+        else if (strcmp(key, "telegram_token")   == 0) snprintf(g_cfg.telegram_token,   sizeof(g_cfg.telegram_token),   "%s", val);
+        else if (strcmp(key, "telegram_chat_id") == 0) snprintf(g_cfg.telegram_chat_id, sizeof(g_cfg.telegram_chat_id), "%s", val);
+        else if (strcmp(key, "telegram_api_url") == 0) snprintf(g_cfg.telegram_api_url, sizeof(g_cfg.telegram_api_url), "%s", val);
+
+        // Integer keys
+        else if (strcmp(key, "keep_count") == 0) {
+            int v = atoi(val);
+            if (v > 0) g_cfg.keep_count = v;
+            else LOGW("%s:%d: keep_count must be > 0", path, lineno);
+        } else if (strcmp(key, "min_free_mb") == 0) {
+            long long v = atoll(val);
+            if (v > 0) g_cfg.min_free_bytes = (unsigned long long)v * 1024ULL * 1024ULL;
+            else LOGW("%s:%d: min_free_mb must be > 0", path, lineno);
+        } else if (strcmp(key, "kernel_fresh_secs") == 0) {
+            int v = atoi(val);
+            if (v > 0) g_cfg.kernel_fresh_secs = v;
+            else LOGW("%s:%d: kernel_fresh_secs must be > 0", path, lineno);
+
+        // Boolean keys
+        } else if (strcmp(key, "boot_compress")    == 0) {
+            int b = parse_bool(val);
+            if (b >= 0) g_cfg.boot_compress    = b;
+            else LOGW("%s:%d: invalid value '%s' for boot_compress", path, lineno, val);
+        } else if (strcmp(key, "auto_rollback")    == 0) {
+            int b = parse_bool(val);
+            if (b >= 0) g_cfg.auto_rollback    = b;
+            else LOGW("%s:%d: invalid value '%s' for auto_rollback", path, lineno, val);
+        } else if (strcmp(key, "snapshot")         == 0) {
+            int b = parse_bool(val);
+            if (b >= 0) g_cfg.do_snapshot      = b;
+            else LOGW("%s:%d: invalid value '%s' for snapshot", path, lineno, val);
+        } else if (strcmp(key, "notify_libnotify") == 0) {
+            int b = parse_bool(val);
+            if (b >= 0) g_cfg.notify_libnotify = b;
+            else LOGW("%s:%d: invalid value '%s' for notify_libnotify", path, lineno, val);
+        } else if (strcmp(key, "notify_telegram")  == 0) {
+            int b = parse_bool(val);
+            if (b >= 0) g_cfg.notify_telegram  = b;
+            else LOGW("%s:%d: invalid value '%s' for notify_telegram", path, lineno, val);
+        } else {
+            LOGW("%s:%d: unknown key '%s'", path, lineno, key);
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+void cfg_print(void) {
+    printf("\n-- Configuration (%s v%s) --\n", PROG_NAME, NS_VERSION);
+    printf("  backup_base        = %s\n", g_cfg.backup_base);
+    printf("  pacman_cache       = %s\n", g_cfg.pacman_cache);
+    printf("  log_file           = %s\n", g_cfg.log_file);
+    printf("  lock_file          = %s\n", g_cfg.lock_file);
+    printf("  keep_count         = %d\n", g_cfg.keep_count);
+    printf("  boot_compress      = %s\n", g_cfg.boot_compress ? "yes (tar.gz)" : "no (cp -a)");
+    printf("  min_free_mb        = %llu\n", g_cfg.min_free_bytes / (1024ULL * 1024ULL));
+    printf("  kernel_fresh_secs  = %d\n", g_cfg.kernel_fresh_secs);
+    printf("  auto_rollback      = %s\n", g_cfg.auto_rollback ? "yes" : "no");
+    printf("  snapshot           = %s\n", g_cfg.do_snapshot   ? "yes" : "no");
+    printf("  notify_libnotify   = %s\n", g_cfg.notify_libnotify ? "yes" : "no");
+    printf("  notify_telegram    = %s\n", g_cfg.notify_telegram  ? "yes" : "no");
+    if (g_cfg.notify_telegram) {
+        printf("  telegram_api_url   = %s\n", g_cfg.telegram_api_url);
+        printf("  telegram_chat_id   = %s\n", g_cfg.telegram_chat_id[0] ? g_cfg.telegram_chat_id : "(not set)");
+        printf("  telegram_token     = %s\n", g_cfg.telegram_token[0]   ? "***"                  : "(not set)");
+    }
+    printf("\n");
+}
+
+// ===== FILE: ./checks.c =====
+#include "checks.h"
+#include "cfg.h"
+#include "log.h"
+#include "proc.h"
+
+int check_pacman_lock(void) {
+    if (access(PACMAN_DB_LOCK, F_OK) == 0) {
+        LOGE("Stale pacman lock detected: %s\n"
+             "       A previous session may have ended abnormally.\n"
+             "       Remove it and retry:\n"
+             "         sudo rm %s",
+             PACMAN_DB_LOCK, PACMAN_DB_LOCK);
+        return -1;
+    }
+    return 0;
+}
+
+int show_pending_updates(void) {
+    LOGI("Checking for available updates");
+    printf("\nPending updates:\n");
+    fflush(stdout);
+    char *argv[] = { PACMAN_BIN, "-Qu", NULL };
+    int ret = run(PACMAN_BIN, argv);
+    if (ret == 1) { printf("Nothing to update.\n"); LOGI("System is up to date"); return 1; }
+    if (ret != 0) { LOGE("pacman -Qu returned %d", ret); return -1; }
+    return 0;
+}
+
+int check_systemctl_health(void) {
+    if (access(SYSTEMCTL_BIN, X_OK) != 0) {
+        LOGW("systemctl not found, skipping health check");
+        return 0;
+    }
+
+    char status[64] = {0};
+    char *argv[] = { SYSTEMCTL_BIN, "is-system-running", NULL };
+    // Exit code is non-zero for anything other than "running"; we use the text output
+    run_capture(SYSTEMCTL_BIN, argv, status, sizeof(status));
+
+    printf("\n-- System health (systemctl) --\n");
+    printf("  Status: %s\n", status[0] ? status : "(no response)");
+
+    if (strcmp(status, "running") == 0) {
+        printf("  All units running normally.\n");
+        LOGI("systemctl is-system-running: running");
+        return 0;
+    }
+
+    if (strcmp(status, "degraded") == 0) {
+        printf("  System is degraded — some units have failed.\n"
+               "  Run 'systemctl --failed' for details.\n");
+        LOGW("systemctl is-system-running: degraded");
+        return 1;
+    }
+
+    // maintenance / offline / unknown / stopping
+    printf("  Critical system state: %s\n"
+           "  Consider rolling back or investigating before rebooting.\n", status);
+    LOGE("systemctl is-system-running: %s", status[0] ? status : "(empty)");
+    return -1;
+}
+
+static int kernel_was_updated(const char *backup_dir) {
+    char before_path[PATH_MAX], after_path[PATH_MAX];
+    int bn = snprintf(before_path, sizeof(before_path), "%s/%s", backup_dir, VERSIONS_BEFORE);
+    int an = snprintf(after_path,  sizeof(after_path),  "%s/%s", backup_dir, VERSIONS_AFTER);
+    if (bn < 0 || (size_t)bn >= sizeof(before_path) ||
+        an < 0 || (size_t)an >= sizeof(after_path))
+        return 0;
+
+    FILE *fb = fopen(before_path, "r");
+    FILE *fa = fopen(after_path,  "r");
+    if (!fb || !fa) {
+        if (fb) fclose(fb);
+        if (fa) fclose(fa);
+        return 0;
+    }
+
+    typedef struct { char name[128]; char ver[128]; } KV;
+    KV *after = calloc((size_t)MAX_PACKAGES, sizeof(KV));
+    int nafter = 0;
+    if (!after) { fclose(fb); fclose(fa); return 0; }
+
+    char line[256];
+    while (fgets(line, (int)sizeof(line), fa) && nafter < MAX_PACKAGES) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        if (sscanf(line, "%127s %127s", after[nafter].name, after[nafter].ver) == 2)
+            nafter++;
+    }
+    fclose(fa);
+
+    int updated = 0;
+    while (fgets(line, (int)sizeof(line), fb) && !updated) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        char bname[128], bver[128];
+        if (sscanf(line, "%127s %127s", bname, bver) != 2) continue;
+        // Match linux, linux-lts, linux-zen, linux-hardened, etc.
+        if (strncmp(bname, "linux", 5) != 0) continue;
+        if (strstr(bname, "-headers") || strstr(bname, "-docs")) continue;
+        for (int i = 0; i < nafter; i++) {
+            if (strcmp(after[i].name, bname) == 0) {
+                if (strcmp(after[i].ver, bver) != 0) updated = 1;
+                break;
+            }
+        }
+    }
+    fclose(fb);
+    free(after);
+    return updated;
+}
+
+int check_kernel_update(const char *backup_dir) {
+    if (!kernel_was_updated(backup_dir)) {
+        LOGI("Kernel was not updated, skipping check");
+        return 0;
+    }
+
+    printf("\n-- Kernel install check --\n");
+    LOGI("Kernel was updated, verifying installation");
+
+    // Prefer the default image; fall back to lts
+    const char *vmlinuz = "/boot/vmlinuz-linux";
+    struct stat st;
+    if (stat(vmlinuz, &st) != 0) {
+        vmlinuz = "/boot/vmlinuz-linux-lts";
+        if (stat(vmlinuz, &st) != 0) {
+            printf("  Kernel image not found at /boot/vmlinuz-linux\n");
+            LOGE("Kernel image missing after update");
+            return -1;
+        }
+    }
+
+    time_t now = time(NULL);
+    double age = difftime(now, st.st_mtime);
+    if (age > g_cfg.kernel_fresh_secs) {
+        printf("  %s last modified %.0f seconds ago (expected < %d)\n",
+               vmlinuz, age, g_cfg.kernel_fresh_secs);
+        LOGE("Kernel package updated but vmlinuz mtime unchanged (%.0f sec old)", age);
+        return -1;
+    }
+    printf("  %s updated %.0f second(s) ago.\n", vmlinuz, age);
+
+    // Verify that the matching module directory exists
+    char cap[128] = {0};
+    char *uname_argv[] = { UNAME_BIN, "-r", NULL };
+    run_capture(UNAME_BIN, uname_argv, cap, sizeof(cap));
+    if (cap[0]) {
+        char moddir[PATH_MAX];
+        int mn = snprintf(moddir, sizeof(moddir), "/usr/lib/modules/%s", cap);
+        if (mn > 0 && (size_t)mn < sizeof(moddir)) {
+            if (access(moddir, F_OK) == 0) {
+                printf("  Kernel modules found: %s\n", moddir);
+                LOGI("Kernel modules: %s", moddir);
+            } else {
+                printf("  Warning: module directory not found: %s\n", moddir);
+                LOGW("Module directory missing: %s", moddir);
+            }
+        }
+    }
+
+    LOGI("Kernel install check passed");
+    return 0;
+}
+
+// ===== FILE: ./lock.c =====
+#include "lock.h"
+#include "cfg.h"
+#include "log.h"
+
+int lock_acquire(void) {
+    int fd = open(g_cfg.lock_file, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        LOGE("Cannot open lock file %s: %s", g_cfg.lock_file, strerror(errno));
+        return -1;
+    }
+
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EWOULDBLOCK) {
+            // Another instance is running; read its PID for a useful message
+            char pidbuf[32] = {0};
+            if (read(fd, pidbuf, sizeof(pidbuf) - 1) > 0)
+                LOGE("Another instance is already running (PID %s)", pidbuf);
+            else
+                LOGE("Another instance is already running");
+        } else {
+            LOGE("flock: %s", strerror(errno));
+        }
+        close(fd);
+        return -1;
+    }
+
+    if (ftruncate(fd, 0) != 0) {
+        LOGE("ftruncate: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    char pidbuf[32];
+    int n = snprintf(pidbuf, sizeof(pidbuf), "%lld\n", (long long)getpid());
+    if (n > 0 && write(fd, pidbuf, (size_t)n) != (ssize_t)n) {
+        LOGE("Failed to write PID: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+void lock_release(int fd) {
+    if (fd < 0) return;
+    flock(fd, LOCK_UN);
+    close(fd);
+    unlink(g_cfg.lock_file);
+}
+
+// ===== FILE: ./log.c =====
+#include "log.h"
+#include "cfg.h"
+
+void log_init(void) {
+    openlog(PROG_NAME, LOG_PID | LOG_NDELAY, LOG_SYSLOG);
+    int fd = open(g_cfg.log_file, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd >= 0)
+        g_logfile = fdopen(fd, "a");
+}
+
+void log_close(void) {
+    if (g_logfile) { fclose(g_logfile); g_logfile = NULL; }
+    closelog();
+}
+
+void log_msg(int prio, const char *prefix, const char *fmt, ...) {
+    va_list ap;
+    time_t now = time(NULL);
+    struct tm tmbuf;
+    char ts[32] = "0000-00-00 00:00:00";
+    if (localtime_r(&now, &tmbuf))
+        strftime(ts, sizeof(ts), "%F %T", &tmbuf);
+
+    char msg[1024];
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    syslog(prio, "%s", msg);
+
+    if (g_logfile) {
+        fprintf(g_logfile, "[%s] %s: %s\n", ts, prefix, msg);
+        fflush(g_logfile);
+    }
+
+    // Warnings and errors go to stderr; info goes to stdout
+    if (prio <= LOG_WARNING)
+        fprintf(stderr, "%s: %s\n", prefix, msg);
+    else
+        printf("%s\n", msg);
+}
+
+// ===== FILE: ./main.c =====
+#include "common.h"
+#include "cfg.h"
+#include "log.h"
+#include "lock.h"
+#include "proc.h"
+#include "utils.h"
+#include "snapshot.h"
+#include "backup.h"
+#include "checks.h"
+#include "update.h"
+#include "notify.h"
+#include "rollback.h"
+
+volatile sig_atomic_t  g_interrupted          = 0;
+char                   g_backup_dir[PATH_MAX]  = {0};
+int                    g_lock_fd              = -1;
+char                   g_btrfs_snap[PATH_MAX]  = {0};
+char                   g_zfs_snap[512]         = {0};
+FILE                  *g_logfile              = NULL;
+int                    g_dry_run              = 0;
+
+static void sig_handler(int sig) { (void)sig; g_interrupted = 1; }
+
+static void signals_setup(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = sig_handler;
+    sa.sa_flags   = SA_RESTART;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP,  &sa, NULL);
+    sa.sa_handler = SIG_IGN;
+    sa.sa_flags   = 0;
+    sigaction(SIGPIPE, &sa, NULL);
+}
+
+static void do_cleanup(void) {
+    if (g_lock_fd >= 0) { lock_release(g_lock_fd); g_lock_fd = -1; }
+    log_close();
+}
+
+static void print_usage(const char *argv0) {
+    printf(
+        "Usage:\n"
+        "  %s [OPTIONS]               Update system with backup\n"
+        "  %s rollback --last         Roll back to the latest backup\n"
+        "  %s rollback <DIR>          Roll back from a specific backup directory\n"
+        "  narch-rollback --last      Alias for 'rollback --last'\n"
+        "\n"
+        "Options:\n"
+        "  --config <FILE>   Config file path (default: %s)\n"
+        "  --dry-run         Simulate all steps without making any changes\n"
+        "  --show-config     Print active configuration and exit\n"
+        "  --no-rollback     Disable automatic rollback on failure\n"
+        "  --no-snapshot     Skip Btrfs/ZFS snapshot\n"
+        "  -h, --help        Show this help\n"
+        "  -v, --version     Print version\n"
+        "\n"
+        "Files:\n"
+        "  Config:   %s\n"
+        "  Backups:  (see backup_base in config)\n"
+        "  Log:      (see log_file in config)\n",
+        argv0, argv0, argv0, DEFAULT_CONF_FILE, DEFAULT_CONF_FILE);
+}
+
+static int run_update(int auto_rollback, int do_snapshot) {
+    printf("==========================================\n");
+    printf("  %s v%s%s\n", PROG_NAME, NS_VERSION,
+           g_dry_run ? "  [DRY-RUN]" : "");
+    printf("==========================================\n\n");
+
+    if (g_dry_run) {
+        printf("  Dry-run mode: no changes will be made.\n");
+        cfg_print();
+    }
+
+    if (geteuid() != 0 && !g_dry_run) {
+        fprintf(stderr, "Root privileges required.\n");
+        return EXIT_ERR_PERM;
+    }
+    if (!g_dry_run && check_pacman_lock() != 0) return EXIT_ERR_LOCK;
+
+    int pending = show_pending_updates();
+    if (pending == 1) return EXIT_OK;
+    if (pending < 0)  return EXIT_ERR_GENERIC;
+    if (g_interrupted) { LOGW("Interrupted"); return EXIT_CANCELLED; }
+
+    if (make_backup_path(g_backup_dir, sizeof(g_backup_dir)) != 0) return EXIT_ERR_BACKUP;
+    printf("\n  Backup: %s\n", g_backup_dir);
+    LOGI("Backup dir: %s", g_backup_dir);
+
+    if (create_backup_dir(g_backup_dir) != 0) return EXIT_ERR_BACKUP;
+
+    // Create a filesystem snapshot before touching anything
+    char ts[32];
+    make_timestamp(ts, sizeof(ts));
+    FsType fstype = FS_OTHER;
+    if (do_snapshot) {
+        fstype = detect_root_fs();
+        if      (fstype == FS_BTRFS) btrfs_snapshot_create(ts);
+        else if (fstype == FS_ZFS)   zfs_snapshot_create(ts);
+    }
+
+    if (g_interrupted) { cleanup_partial_backup(g_backup_dir); return EXIT_CANCELLED; }
+
+    printf("\n-- Creating backup --\n");
+    if (do_full_backup(g_backup_dir) != 0) {
+        cleanup_partial_backup(g_backup_dir);
+        return EXIT_ERR_BACKUP;
+    }
+
+    if (g_interrupted) { cleanup_partial_backup(g_backup_dir); return EXIT_CANCELLED; }
+
+    // Mark backup complete before the update so rollback can reference it immediately
+    write_sentinel(g_backup_dir);
+
+    const char *snap = (fstype == FS_BTRFS) ? g_btrfs_snap :
+                       (fstype == FS_ZFS)   ? g_zfs_snap   : NULL;
+    write_recovery_guide(g_backup_dir, fstype, snap);
+
+    notify_send(NOTIFY_BACKUP_DONE, g_backup_dir);
+
+    int upd_rc = do_update_with_checks(g_backup_dir, auto_rollback);
+
+    // Refresh the guide with the post-update package versions
+    write_recovery_guide(g_backup_dir, fstype, snap);
+
+    cleanup_old_backups();
+
+    printf("\n-- Summary --\n");
+    printf("  Backup:   %s\n", g_backup_dir);
+    printf("  Log:      %s\n", g_cfg.log_file);
+    if (snap && snap[0])
+        printf("  Snapshot: %s\n", snap);
+    printf("  Recovery: %s/%s\n", g_backup_dir, RECOVERY_FILE);
+
+    if (g_dry_run) {
+        printf("\n  [DRY-RUN] No changes were made.\n");
+        notify_send(NOTIFY_DRY_RUN_DONE, NULL);
+        return EXIT_OK;
+    }
+
+    if (upd_rc == 0)  { printf("\n  Done.\n");                           return EXIT_OK; }
+    if (upd_rc == 1)  { printf("\n  Update failed — rollback applied.\n"); return EXIT_ROLLBACK_OK; }
+    return EXIT_ERR_UPDATE;
+}
+
+int main(int argc, char *argv[]) {
+    cfg_load_defaults();
+
+    // Pre-scan for --config before log_init so the correct log path is used
+    const char *conf_path = DEFAULT_CONF_FILE;
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--config") == 0) { conf_path = argv[i + 1]; break; }
+    }
+    cfg_parse_file(conf_path);
+
+    log_init();
+    signals_setup();
+    atexit(do_cleanup);
+
+    // Support invocation as a standalone rollback binary
+    const char *base = strrchr(argv[0], '/');
+    base = base ? base + 1 : argv[0];
+    int mode_rollback = (strcmp(base, "narch-rollback") == 0);
+
+    int  auto_rollback = g_cfg.auto_rollback;
+    int  do_snapshot   = g_cfg.do_snapshot;
+    int  show_config   = 0;
+    char rollback_dir[PATH_MAX] = {0};
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help")    == 0 || strcmp(argv[i], "-h") == 0) { print_usage(argv[0]); return EXIT_OK; }
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) { printf("%s v%s\n", PROG_NAME, NS_VERSION); return EXIT_OK; }
+        if (strcmp(argv[i], "--dry-run")     == 0) { g_dry_run     = 1; continue; }
+        if (strcmp(argv[i], "--show-config") == 0) { show_config   = 1; continue; }
+        if (strcmp(argv[i], "--no-rollback") == 0) { auto_rollback = 0; continue; }
+        if (strcmp(argv[i], "--no-snapshot") == 0) { do_snapshot   = 0; continue; }
+        if (strcmp(argv[i], "--config")      == 0) { i++;               continue; }
+        if (strcmp(argv[i], "rollback")      == 0) { mode_rollback = 1; continue; }
+        if (strcmp(argv[i], "--last")        == 0) { mode_rollback = 1; continue; }
+
+        // Positional backup directory argument for explicit rollback
+        if (mode_rollback && argv[i][0] == '/') {
+            snprintf(rollback_dir, sizeof(rollback_dir), "%s", argv[i]);
+            continue;
+        }
+
+        fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+        print_usage(argv[0]);
+        return EXIT_ERR_GENERIC;
+    }
+
+    if (show_config) { cfg_print(); return EXIT_OK; }
+
+    LOGI("=== %s v%s start (dry_run=%d) ===", PROG_NAME, NS_VERSION, g_dry_run);
+
+    if (geteuid() != 0 && !g_dry_run) {
+        fprintf(stderr, "Root privileges required. Use sudo.\n");
+        return EXIT_ERR_PERM;
+    }
+
+    if (!g_dry_run) {
+        g_lock_fd = lock_acquire();
+        if (g_lock_fd < 0) return EXIT_ERR_LOCK;
+    }
+
+    int rc;
+    if (mode_rollback) {
+        LOGI("Mode: rollback");
+        if (rollback_dir[0] != '\0') {
+            if (access(rollback_dir, F_OK) != 0) {
+                LOGE("Backup directory not found: %s", rollback_dir);
+                return EXIT_ERR_GENERIC;
+            }
+            rc = do_rollback(rollback_dir);
+        } else {
+            rc = rollback_from_last();
+        }
+        if (rc == 0) notify_send(NOTIFY_ROLLBACK_OK, NULL);
+        else         notify_send(NOTIFY_ROLLBACK_FAIL, NULL);
+        return rc == 0 ? EXIT_OK : EXIT_ERR_GENERIC;
+    }
+
+    LOGI("Mode: update (auto_rollback=%d snapshot=%d dry_run=%d)",
+         auto_rollback, do_snapshot, g_dry_run);
+    rc = run_update(auto_rollback, do_snapshot);
+    return rc;
+}
+
+// ===== FILE: ./notify.c =====
+#include "notify.h"
+#include "cfg.h"
+#include "log.h"
+
+static void _notify_libnotify(const char *title, const char *body, const char *icon) {
+    if (access(NOTIFY_SEND_BIN, X_OK) != 0) {
+        LOGW("notify-send not found at %s", NOTIFY_SEND_BIN);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) { LOGW("fork for notify-send: %s", strerror(errno)); return; }
+    if (pid == 0) {
+        signal(SIGINT, SIG_DFL);
+        if (icon && icon[0])
+            execlp(NOTIFY_SEND_BIN, NOTIFY_SEND_BIN,
+                   "--app-name=" PROG_NAME, "-i", icon, "--", title, body, NULL);
+        else
+            execlp(NOTIFY_SEND_BIN, NOTIFY_SEND_BIN,
+                   "--app-name=" PROG_NAME, "--", title, body, NULL);
+        _exit(1);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        LOGW("notify-send exited with %d", WEXITSTATUS(status));
+}
+
+static void _escape_html(const char *src, char *dst, size_t dstsz) {
+    size_t i = 0;
+    while (*src && i + 10 < dstsz) {
+        if      (*src == '<') { memcpy(dst+i, "&lt;",  4); i += 4; }
+        else if (*src == '>') { memcpy(dst+i, "&gt;",  4); i += 4; }
+        else if (*src == '&') { memcpy(dst+i, "&amp;", 5); i += 5; }
+        else                  { dst[i++] = *src; }
+        src++;
+    }
+    dst[i] = '\0';
+}
+
+static void _notify_telegram(const char *title, const char *body) {
+    if (!g_cfg.telegram_token[0] || !g_cfg.telegram_chat_id[0]) {
+        LOGW("Telegram: token or chat_id not configured");
+        return;
+    }
+    if (access(CURL_BIN, X_OK) != 0) {
+        LOGW("curl not found at %s, skipping Telegram notification", CURL_BIN);
+        return;
+    }
+
+    char etitle[256], ebody[1024];
+    _escape_html(title, etitle, sizeof(etitle));
+    _escape_html(body,  ebody,  sizeof(ebody));
+
+    char msg[1536];
+    snprintf(msg, sizeof(msg), "<b>%s</b>\n%s", etitle, ebody);
+
+    char url[768];
+    snprintf(url, sizeof(url), "%s/bot%s/sendMessage",
+             g_cfg.telegram_api_url, g_cfg.telegram_token);
+
+    LOGI("Sending Telegram notification");
+
+    /* Pass each field separately so curl handles URL-encoding correctly.
+     * Never concatenate chat_id or msg into a single --data-urlencode arg —
+     * that is an injection vector if either field contains special characters. */
+    pid_t pid = fork();
+    if (pid < 0) { LOGW("fork for curl: %s", strerror(errno)); return; }
+    if (pid == 0) {
+        signal(SIGINT, SIG_DFL);
+        // Suppress curl output — we only care about the exit code
+        int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); dup2(devnull, STDERR_FILENO); close(devnull); }
+
+        char chat_id_param[128];
+        snprintf(chat_id_param, sizeof(chat_id_param), "chat_id=%s", g_cfg.telegram_chat_id);
+        char text_param[1600];
+        snprintf(text_param, sizeof(text_param), "text=%s", msg);
+
+        execlp(CURL_BIN, CURL_BIN, "-sS", "--max-time", "10",
+               "-X", "POST", url,
+               "--data-urlencode", chat_id_param,
+               "--data-urlencode", "parse_mode=HTML",
+               "--data-urlencode", text_param,
+               NULL);
+        _exit(1);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        LOGW("curl (Telegram) exited with %d", WEXITSTATUS(status));
+    else
+        LOGI("Telegram notification sent");
+}
+
+void notify_message(const char *title, const char *body, const char *icon) {
+    if (g_cfg.notify_libnotify) _notify_libnotify(title, body, icon);
+    if (g_cfg.notify_telegram)  _notify_telegram(title, body);
+}
+
+void notify_send(NotifyEvent event, const char *detail) {
+    const char *title = PROG_NAME;
+    char body[512]    = {0};
+    const char *icon  = "dialog-information";
+
+    switch (event) {
+    case NOTIFY_UPDATE_START:
+        snprintf(body, sizeof(body), "Starting system update...");
+        icon = "system-software-update";
+        break;
+    case NOTIFY_BACKUP_DONE:
+        snprintf(body, sizeof(body), "Backup created:\n%s", detail ? detail : "");
+        icon = "drive-harddisk";
+        break;
+    case NOTIFY_UPDATE_OK:
+        snprintf(body, sizeof(body), "System updated successfully.");
+        icon = "emblem-default";
+        break;
+    case NOTIFY_UPDATE_FAIL:
+        snprintf(body, sizeof(body), "Update FAILED.%s%s",
+                 detail ? "\n" : "", detail ? detail : "");
+        icon = "dialog-error";
+        break;
+    case NOTIFY_ROLLBACK_OK:
+        snprintf(body, sizeof(body), "Rollback completed successfully.\n%s",
+                 detail ? detail : "");
+        icon = "edit-undo";
+        break;
+    case NOTIFY_ROLLBACK_FAIL:
+        snprintf(body, sizeof(body), "Rollback FAILED.\n%s",
+                 detail ? detail : "");
+        icon = "dialog-error";
+        break;
+    case NOTIFY_DRY_RUN_DONE:
+        snprintf(body, sizeof(body), "[DRY-RUN] Simulation complete — no changes were made.");
+        icon = "dialog-information";
+        break;
+    }
+
+    LOGI("Notification: %s", body);
+    notify_message(title, body, icon);
+}
+
+// ===== FILE: ./proc.c =====
+#include "proc.h"
+#include "log.h"
+
+char *const SAFE_ENV[] = {
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME=/root",
+    "LANG=C",
+    NULL
+};
+
+void child_init(void) {
+    // Close the log fd so it is not inherited across fork
+    if (g_logfile) { fclose(g_logfile); g_logfile = NULL; }
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+    signal(SIGINT,  SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGPIPE, SIG_DFL);
+}
+
+int wait_child(pid_t pid, const char *name) {
+    int status;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        LOGE("waitpid(%s): %s", name, strerror(errno));
+        return -1;
+    }
+    if (WIFSIGNALED(status)) {
+        LOGW("%s killed by signal %d", name, WTERMSIG(status));
+        return -1;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
+int run(const char *path, char *const argv[]) {
+    if (access(path, X_OK) != 0) { LOGE("%s: not found or not executable", path); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) { LOGE("fork: %s", strerror(errno)); return -1; }
+    if (pid == 0) {
+        child_init();
+        execve(path, argv, SAFE_ENV);
+        static const char e[] = "execve failed\n";
+        ssize_t wr = write(STDERR_FILENO, e, sizeof(e) - 1);
+        (void)wr;
+        _exit(127);
+    }
+    return wait_child(pid, path);
+}
+
+int run_to_file(const char *path, char *const argv[], const char *outpath) {
+    if (access(path, X_OK) != 0) { LOGE("%s: not found", path); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) { LOGE("fork: %s", strerror(errno)); return -1; }
+    if (pid == 0) {
+        child_init();
+        int fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd < 0) _exit(1);
+        if (dup2(fd, STDOUT_FILENO) < 0) _exit(1);
+        close(fd);
+        execve(path, argv, SAFE_ENV);
+        _exit(127);
+    }
+    return wait_child(pid, path);
+}
+
+int run_tee(const char *path, char *const argv[], FILE *logfp) {
+    if (access(path, X_OK) != 0) { LOGE("%s: not found", path); return -1; }
+    int pfd[2];
+    if (pipe(pfd) != 0) { LOGE("pipe: %s", strerror(errno)); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]); close(pfd[1]);
+        LOGE("fork: %s", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        close(pfd[0]);
+        if (dup2(pfd[1], STDOUT_FILENO) < 0) _exit(1);
+        if (dup2(pfd[1], STDERR_FILENO) < 0) _exit(1);
+        close(pfd[1]);
+        child_init();
+        execve(path, argv, SAFE_ENV);
+        _exit(127);
+    }
+    close(pfd[1]);
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(pfd[0], buf, sizeof(buf))) > 0) {
+        fwrite(buf, 1, (size_t)n, stdout);
+        fflush(stdout);
+        if (logfp) { fwrite(buf, 1, (size_t)n, logfp); fflush(logfp); }
+    }
+    close(pfd[0]);
+    return wait_child(pid, path);
+}
+
+int run_capture(const char *path, char *const argv[], char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0) return -1;
+    buf[0] = '\0';
+    if (access(path, X_OK) != 0) { LOGE("%s: not found", path); return -1; }
+    int pfd[2];
+    if (pipe(pfd) != 0) { LOGE("pipe: %s", strerror(errno)); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]); close(pfd[1]);
+        LOGE("fork: %s", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        close(pfd[0]);
+        if (dup2(pfd[1], STDOUT_FILENO) < 0) _exit(1);
+        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (devnull >= 0) dup2(devnull, STDERR_FILENO);
+        close(pfd[1]);
+        child_init();
+        execve(path, argv, SAFE_ENV);
+        _exit(127);
+    }
+    close(pfd[1]);
+    size_t total = 0;
+    ssize_t n;
+    while ((n = read(pfd[0], buf + total, bufsz - 1 - total)) > 0)
+        total += (size_t)n;
+    buf[total] = '\0';
+    // Drop trailing newline so callers can use the string directly
+    if (total > 0 && buf[total - 1] == '\n') buf[--total] = '\0';
+    close(pfd[0]);
+    return wait_child(pid, path);
+}
+
+int run_mut(const char *path, char *const argv[]) {
+    if (g_dry_run) {
+        printf("  [DRY-RUN] would run:");
+        for (int i = 0; argv[i]; i++) printf(" %s", argv[i]);
+        printf("\n");
+        return 0;
+    }
+    return run(path, argv);
+}
+
+int run_tee_mut(const char *path, char *const argv[], FILE *logfp) {
+    if (g_dry_run) {
+        printf("  [DRY-RUN] would run:");
+        for (int i = 0; argv[i]; i++) printf(" %s", argv[i]);
+        printf("\n");
+        if (logfp) fprintf(logfp, "[DRY-RUN] skipped\n");
+        return 0;
+    }
+    return run_tee(path, argv, logfp);
+}
+
+// ===== FILE: ./rollback.c =====
+#include "rollback.h"
+#include "cfg.h"
+#include "log.h"
+#include "proc.h"
+#include "utils.h"
+
+int parse_pkg_file(FILE *fp, PkgInfo *arr, int max) {
+    int count = 0;
+    char line[256];
+    while (fgets(line, (int)sizeof(line), fp) && count < max) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        if (sscanf(line, "%127s %127s", arr[count].name, arr[count].ver) == 2)
+            count++;
+    }
+    return count;
+}
+
+static int cmp_pkg(const void *a, const void *b) {
+    return strcmp(((const PkgInfo *)a)->name, ((const PkgInfo *)b)->name);
+}
+
+void sort_pkgs(PkgInfo *arr, int n) {
+    qsort(arr, (size_t)n, sizeof(PkgInfo), cmp_pkg);
+}
+
+int find_pkg_in_cache(const char *name, const char *ver, char *out, size_t outsz) {
+    char prefix[260];
+    int pn = snprintf(prefix, sizeof(prefix), "%s-%s-", name, ver);
+    if (pn < 0 || (size_t)pn >= sizeof(prefix)) return -1;
+    size_t prelen = strlen(prefix);
+    DIR *d = opendir(g_cfg.pacman_cache);
+    if (!d) return -1;
+    int found = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && !found) {
+        if (strncmp(ent->d_name, prefix, prelen) != 0) continue;
+        if (!strstr(ent->d_name, ".pkg.tar.")) continue;
+        int n = snprintf(out, outsz, "%s/%s", g_cfg.pacman_cache, ent->d_name);
+        if (n > 0 && (size_t)n < outsz) found = 1;
+    }
+    closedir(d);
+    return found ? 0 : -1;
+}
+
+int do_rollback(const char *backup_dir) {
+    LOGI("=== Rollback started from %s ===", backup_dir);
+    printf("\n==========================================\n");
+    printf("  SYSTEM ROLLBACK\n");
+    printf("==========================================\n");
+    printf("  Source: %s\n\n", backup_dir);
+
+    char rblog_path[PATH_MAX];
+    snprintf(rblog_path, sizeof(rblog_path), "%s/%s", backup_dir, ROLLBACK_LOG);
+    int rblog_fd = open(rblog_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    FILE *rblog = (rblog_fd >= 0) ? fdopen(rblog_fd, "w") : NULL;
+    if (rblog_fd >= 0 && !rblog) close(rblog_fd);
+    if (rblog) {
+        time_t now = time(NULL);
+        struct tm tmbuf; char ts[64] = "";
+        if (localtime_r(&now, &tmbuf)) strftime(ts, sizeof(ts), "%F %T", &tmbuf);
+        fprintf(rblog, "rollback_started=%s\nbackup_dir=%s\n\n", ts, backup_dir);
+        fflush(rblog);
+    }
+
+    // Restore /boot — prefer the tar.gz archive, fall back to directory copy
+    printf("[Rollback 1/4] Restoring /boot...\n");
+    char boot_tar[PATH_MAX], boot_dir[PATH_MAX];
+    snprintf(boot_tar, sizeof(boot_tar), "%s/%s", backup_dir, BOOT_BACKUP_NAME);
+    snprintf(boot_dir, sizeof(boot_dir), "%s/boot",           backup_dir);
+
+    if (access(boot_tar, F_OK) == 0) {
+        char *argv[] = { TAR_BIN, "-xpzf", (char *)boot_tar, "-C", "/", NULL };
+        if (run_mut(TAR_BIN, argv) == 0) {
+            LOGI("/boot restored from archive %s", boot_tar);
+            printf("  /boot restored from tar.gz\n");
+            if (rblog) fprintf(rblog, "boot_restored=tar\n");
+        } else {
+            LOGW("Failed to extract %s", boot_tar);
+            printf("  Warning: failed to restore /boot from archive\n");
+        }
+    } else if (access(boot_dir, F_OK) == 0) {
+        char *argv[] = { CP_BIN, "-af", (char *)boot_dir, "/", NULL };
+        if (run_mut(CP_BIN, argv) == 0) {
+            LOGI("/boot restored from %s", boot_dir);
+            printf("  /boot restored\n");
+            if (rblog) fprintf(rblog, "boot_restored=cp\n");
+        } else {
+            LOGW("Failed to restore /boot from %s", boot_dir);
+            printf("  Warning: failed to restore /boot\n");
+        }
+    } else {
+        printf("  Warning: no /boot backup found, skipping\n");
+        LOGW("No /boot backup in %s", backup_dir);
+    }
+
+    // Load the package state from before the update
+    printf("[Rollback 2/4] Loading pre-update package list...\n");
+    char before_path[PATH_MAX];
+    snprintf(before_path, sizeof(before_path), "%s/%s", backup_dir, VERSIONS_BEFORE);
+    FILE *fb = fopen(before_path, "r");
+    if (!fb) {
+        LOGE("Cannot open %s: %s", before_path, strerror(errno));
+        if (rblog) { fprintf(rblog, "error=cannot_open_versions_before\n"); fclose(rblog); }
+        return -1;
+    }
+    PkgInfo *before = calloc((size_t)MAX_PACKAGES, sizeof(PkgInfo));
+    if (!before) { fclose(fb); if (rblog) fclose(rblog); return -1; }
+    int nbefore = parse_pkg_file(fb, before, MAX_PACKAGES);
+    fclose(fb);
+    sort_pkgs(before, nbefore);
+    printf("  Packages before update: %d\n", nbefore);
+
+    // Get the current installed package list for diffing
+    printf("[Rollback 3/4] Reading current package state...\n");
+    char cur_path[PATH_MAX];
+    snprintf(cur_path, sizeof(cur_path), "%s/current_versions.tmp", backup_dir);
+    {
+        char *argv[] = { PACMAN_BIN, "-Q", NULL };
+        run_to_file(PACMAN_BIN, argv, cur_path);
+    }
+    FILE *fc = fopen(cur_path, "r");
+    if (!fc) {
+        LOGE("Cannot read current package list");
+        free(before);
+        if (rblog) fclose(rblog);
+        return -1;
+    }
+    PkgInfo *current = calloc((size_t)MAX_PACKAGES, sizeof(PkgInfo));
+    if (!current) { fclose(fc); free(before); if (rblog) fclose(rblog); return -1; }
+    int ncurrent = parse_pkg_file(fc, current, MAX_PACKAGES);
+    fclose(fc);
+    unlink(cur_path);
+    sort_pkgs(current, ncurrent);
+
+    // Build the downgrade and removal argument lists
+    printf("[Rollback 4/4] Applying package rollback...\n");
+
+    char *downgrade_argv[MAX_ROLLBACK_PKGS + 4];
+    int  ndowngrade = 0;
+    downgrade_argv[ndowngrade++] = PACMAN_BIN;
+    downgrade_argv[ndowngrade++] = "-U";
+    downgrade_argv[ndowngrade++] = "--noconfirm";
+
+    char *remove_argv[MAX_ROLLBACK_PKGS + 4];
+    int  nremove = 0;
+    remove_argv[nremove++] = PACMAN_BIN;
+    remove_argv[nremove++] = "-Rns";
+    remove_argv[nremove++] = "--noconfirm";
+
+    int missing_cache = 0;
+    char **pkgpaths = calloc((size_t)MAX_ROLLBACK_PKGS, sizeof(char *));
+    if (!pkgpaths) { free(before); free(current); if (rblog) fclose(rblog); return -1; }
+
+    for (int i = 0; i < nbefore && (ndowngrade - 3) < MAX_ROLLBACK_PKGS; i++) {
+        PkgInfo key;
+        strncpy(key.name, before[i].name, sizeof(key.name) - 1);
+        key.name[sizeof(key.name) - 1] = '\0';
+
+        PkgInfo *found = bsearch(&key, current, (size_t)ncurrent, sizeof(PkgInfo), cmp_pkg);
+        int need_install = (!found || strcmp(found->ver, before[i].ver) != 0);
+
+        if (need_install) {
+            char ppath[PATH_MAX];
+            if (find_pkg_in_cache(before[i].name, before[i].ver, ppath, sizeof(ppath)) == 0) {
+                int idx = ndowngrade - 3;
+                pkgpaths[idx] = strdup(ppath);
+                downgrade_argv[ndowngrade] = pkgpaths[idx];
+                ndowngrade++;
+                if (!found)
+                    printf("  reinstall: %s %s\n", before[i].name, before[i].ver);
+                else
+                    printf("  downgrade: %-30s %s -> %s\n",
+                           before[i].name, found->ver, before[i].ver);
+                if (rblog) fprintf(rblog, "%s=%s-%s\n",
+                                   found ? "downgrade" : "reinstall",
+                                   before[i].name, before[i].ver);
+            } else {
+                printf("  skip (not in cache): %s %s\n", before[i].name, before[i].ver);
+                LOGW("Not in cache: %s %s", before[i].name, before[i].ver);
+                if (rblog) fprintf(rblog, "missing_cache=%s-%s\n", before[i].name, before[i].ver);
+                missing_cache++;
+            }
+        }
+    }
+
+    // Packages installed during the update that did not exist before
+    for (int i = 0; i < ncurrent && (nremove - 3) < MAX_ROLLBACK_PKGS; i++) {
+        PkgInfo key;
+        strncpy(key.name, current[i].name, sizeof(key.name) - 1);
+        key.name[sizeof(key.name) - 1] = '\0';
+        PkgInfo *found = bsearch(&key, before, (size_t)nbefore, sizeof(PkgInfo), cmp_pkg);
+        if (!found) {
+            remove_argv[nremove++] = current[i].name;
+            printf("  remove (new package): %s %s\n", current[i].name, current[i].ver);
+            if (rblog) fprintf(rblog, "remove=%s-%s\n", current[i].name, current[i].ver);
+        }
+    }
+
+    int rc = 0;
+
+    if (ndowngrade > 3) {
+        downgrade_argv[ndowngrade] = NULL;
+        printf("\n  Running pacman -U (%d package(s))...\n", ndowngrade - 3);
+        LOGI("pacman -U: %d package(s)", ndowngrade - 3);
+        if (run_mut(PACMAN_BIN, downgrade_argv) != 0) {
+            LOGE("pacman -U failed");
+            if (rblog) fprintf(rblog, "downgrade_status=FAILED\n");
+            rc = -1;
+        } else {
+            if (rblog) fprintf(rblog, "downgrade_status=OK\n");
+        }
+    }
+
+    if (nremove > 3) {
+        remove_argv[nremove] = NULL;
+        printf("\n  Running pacman -Rns (%d package(s))...\n", nremove - 3);
+        LOGI("pacman -Rns: %d package(s)", nremove - 3);
+        if (run_mut(PACMAN_BIN, remove_argv) != 0) {
+            LOGE("pacman -Rns failed");
+            if (rblog) fprintf(rblog, "remove_status=FAILED\n");
+            rc = -1;
+        } else {
+            if (rblog) fprintf(rblog, "remove_status=OK\n");
+        }
+    }
+
+    for (int i = 0; i < ndowngrade - 3; i++) free(pkgpaths[i]);
+    free(pkgpaths);
+    free(before);
+    free(current);
+
+    if (missing_cache > 0)
+        printf("\n  Warning: %d package(s) were not in cache.\n"
+               "  See %s for manual recovery steps.\n",
+               missing_cache, rblog_path);
+
+    if (rc == 0) printf("\n  Rollback complete.\n");
+    else         printf("\n  Rollback finished with errors. See %s\n", rblog_path);
+
+    LOGI("=== Rollback finished (rc=%d) ===", rc);
+    if (rblog) {
+        fprintf(rblog, "rollback_rc=%d\nmissing_cache=%d\n", rc, missing_cache);
+        fclose(rblog);
+    }
+    return rc;
+}
+
+int rollback_from_last(void) {
+    char last[PATH_MAX];
+    if (find_last_backup(last, sizeof(last)) != 0) {
+        LOGE("No backups available to roll back from");
+        return -1;
+    }
+    LOGI("Rolling back from: %s", last);
+    printf("\nRolling back from: %s\n", last);
+    return do_rollback(last);
+}
+
+void write_recovery_guide(const char *backup_dir, FsType fstype, const char *snap_name) {
+    char path[PATH_MAX];
+    int pn = snprintf(path, sizeof(path), "%s/%s", backup_dir, RECOVERY_FILE);
+    if (pn < 0 || (size_t)pn >= sizeof(path)) return;
+
+    FILE *f = fopen(path, "w");
+    if (!f) { LOGW("Cannot create recovery.txt: %s", strerror(errno)); return; }
+
+    time_t now = time(NULL);
+    struct tm tmbuf; char ts[64] = "unknown";
+    if (localtime_r(&now, &tmbuf)) strftime(ts, sizeof(ts), "%F %T", &tmbuf);
+
+    fprintf(f,
+        "=======================================================================\n"
+        " RECOVERY GUIDE — %s v%s\n"
+        " Generated: %s\n"
+        " Backup:    %s\n"
+        "=======================================================================\n\n",
+        PROG_NAME, NS_VERSION, ts, backup_dir);
+
+    fprintf(f,
+        "-----------------------------------------------------------------------\n"
+        "1. RESTORE /boot\n"
+        "-----------------------------------------------------------------------\n"
+        "# If the system does not boot, use a live USB:\n\n"
+        "  mount /dev/sdXY /mnt\n"
+        "  mount /dev/sdXZ /mnt/boot      # if /boot is a separate partition\n\n"
+        "  # If boot was compressed (tar.gz):\n"
+        "  tar -xpzf %s/%s -C /mnt\n\n"
+        "  # If boot was copied as a directory:\n"
+        "  cp -a %s/boot/* /mnt/boot/\n\n",
+        backup_dir, BOOT_BACKUP_NAME, backup_dir);
+
+    fprintf(f,
+        "-----------------------------------------------------------------------\n"
+        "2. RESTORE /etc\n"
+        "-----------------------------------------------------------------------\n"
+        "  # Full restore (overwrites all configs):\n"
+        "  tar -xpzf %s/%s -C /\n\n"
+        "  # Single file:\n"
+        "  tar -xpzf %s/%s -C / etc/filename\n\n",
+        backup_dir, ETC_BACKUP_NAME,
+        backup_dir, ETC_BACKUP_NAME);
+
+    fprintf(f,
+        "-----------------------------------------------------------------------\n"
+        "3. RESTORE PACMAN DATABASE\n"
+        "-----------------------------------------------------------------------\n"
+        "  cp -a %s/%s/* /var/lib/pacman/local/\n\n",
+        backup_dir, PACMAN_DB_BACKUP);
+
+    fprintf(f,
+        "-----------------------------------------------------------------------\n"
+        "4. AUTO ROLLBACK (recommended)\n"
+        "-----------------------------------------------------------------------\n"
+        "  narch-rollback --last\n"
+        "  # or:\n"
+        "  narchsafe rollback --last\n\n");
+
+    fprintf(f,
+        "-----------------------------------------------------------------------\n"
+        "5. MANUAL PACKAGE ROLLBACK\n"
+        "-----------------------------------------------------------------------\n"
+        "  pacman -U %s/<pkgname>-<ver>-<arch>.pkg.tar.zst\n\n"
+        "  # Pre-update package versions:\n"
+        "  cat %s/%s\n\n"
+        "  # Diff (shows what changed):\n"
+        "  diff %s/%s %s/%s\n\n",
+        g_cfg.pacman_cache,
+        backup_dir, VERSIONS_BEFORE,
+        backup_dir, VERSIONS_BEFORE,
+        backup_dir, VERSIONS_AFTER);
+
+    if (fstype == FS_BTRFS && snap_name && snap_name[0]) {
+        fprintf(f,
+            "-----------------------------------------------------------------------\n"
+            "6. BTRFS SNAPSHOT ROLLBACK\n"
+            "-----------------------------------------------------------------------\n"
+            "  Snapshot: %s\n\n"
+            "  # From a live USB:\n"
+            "  mount /dev/sdX /mnt\n"
+            "  btrfs subvolume delete /mnt/@\n"
+            "  btrfs subvolume snapshot %s /mnt/@\n"
+            "  reboot\n\n",
+            snap_name, snap_name);
+    } else if (fstype == FS_ZFS && snap_name && snap_name[0]) {
+        fprintf(f,
+            "-----------------------------------------------------------------------\n"
+            "6. ZFS SNAPSHOT ROLLBACK\n"
+            "-----------------------------------------------------------------------\n"
+            "  Snapshot: %s\n\n"
+            "  zfs rollback -r %s\n"
+            "  reboot\n\n",
+            snap_name, snap_name);
+    }
+
+    fprintf(f,
+        "-----------------------------------------------------------------------\n"
+        "7. EMERGENCY RECOVERY (live USB)\n"
+        "-----------------------------------------------------------------------\n"
+        "  1. Boot Arch Linux live USB\n"
+        "  2. mount /dev/sdXY /mnt && arch-chroot /mnt\n"
+        "  3. pacman -Syu     # or downgrade from cache\n"
+        "  4. mkinitcpio -P   # rebuild initramfs\n"
+        "  5. grub-mkconfig -o /boot/grub/grub.cfg\n"
+        "  6. exit && reboot\n\n"
+        "=======================================================================\n"
+        " Log:          %s\n"
+        " Rollback log: %s/%s\n"
+        "=======================================================================\n",
+        g_cfg.log_file, backup_dir, ROLLBACK_LOG);
+
+    fclose(f);
+    LOGI("Recovery guide written: %s", path);
+    printf("  Recovery guide: %s\n", path);
+}
+
+// ===== FILE: ./snapshot.c =====
+#include "snapshot.h"
+#include "log.h"
+#include "proc.h"
+
+FsType detect_root_fs(void) {
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (!fp) return FS_OTHER;
+    char line[512];
+    FsType result = FS_OTHER;
+    while (fgets(line, (int)sizeof(line), fp)) {
+        char dev[256], mnt[256], fstype[64];
+        if (sscanf(line, "%255s %255s %63s", dev, mnt, fstype) != 3) continue;
+        if (strcmp(mnt, "/") != 0) continue;
+        if (strcmp(fstype, "btrfs") == 0) { result = FS_BTRFS; break; }
+        if (strcmp(fstype, "zfs")   == 0) { result = FS_ZFS;   break; }
+    }
+    fclose(fp);
+    return result;
+}
+
+int get_zfs_root_dataset(char *buf, size_t size) {
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (!fp) return -1;
+    char line[512];
+    int found = 0;
+    while (fgets(line, (int)sizeof(line), fp)) {
+        char dev[256], mnt[256], fstype[64];
+        if (sscanf(line, "%255s %255s %63s", dev, mnt, fstype) != 3) continue;
+        if (strcmp(mnt, "/") != 0 || strcmp(fstype, "zfs") != 0) continue;
+        int n = snprintf(buf, size, "%s", dev);
+        if (n > 0 && (size_t)n < size) found = 1;
+        break;
+    }
+    fclose(fp);
+    return found ? 0 : -1;
+}
+
+int btrfs_snapshot_create(const char *ts) {
+    if (access(BTRFS_BIN, X_OK) != 0) {
+        LOGW("btrfs not found at %s, skipping snapshot", BTRFS_BIN);
+        return -1;
+    }
+
+    int n = snprintf(g_btrfs_snap, sizeof(g_btrfs_snap), BTRFS_SNAP_PREFIX "%s", ts);
+    if (n < 0 || (size_t)n >= sizeof(g_btrfs_snap)) return -1;
+
+    LOGI("Creating Btrfs snapshot: %s", g_btrfs_snap);
+    printf("  Btrfs snapshot: %s\n", g_btrfs_snap);
+
+    char *argv[] = {
+        BTRFS_BIN, "subvolume", "snapshot", "-r",
+        "/", (char *)g_btrfs_snap, NULL
+    };
+    int ret = run_mut(BTRFS_BIN, argv);
+    if (ret != 0) {
+        LOGW("Btrfs snapshot failed (exit %d), proceeding without it", ret);
+        g_btrfs_snap[0] = '\0';
+        return -1;
+    }
+
+    LOGI("Btrfs snapshot created: %s", g_btrfs_snap);
+    return 0;
+}
+
+int zfs_snapshot_create(const char *ts) {
+    if (access(ZFS_BIN, X_OK) != 0) {
+        LOGW("zfs not found at %s, skipping snapshot", ZFS_BIN);
+        return -1;
+    }
+
+    char dataset[256];
+    if (get_zfs_root_dataset(dataset, sizeof(dataset)) != 0) {
+        LOGW("Cannot determine ZFS dataset for /");
+        return -1;
+    }
+
+    int n = snprintf(g_zfs_snap, sizeof(g_zfs_snap),
+                     "%s@" ZFS_SNAP_PREFIX "%s", dataset, ts);
+    if (n < 0 || (size_t)n >= sizeof(g_zfs_snap)) return -1;
+
+    LOGI("Creating ZFS snapshot: %s", g_zfs_snap);
+    printf("  ZFS snapshot: %s\n", g_zfs_snap);
+
+    char *argv[] = { ZFS_BIN, "snapshot", (char *)g_zfs_snap, NULL };
+    int ret = run_mut(ZFS_BIN, argv);
+    if (ret != 0) {
+        LOGW("ZFS snapshot failed (exit %d), proceeding without it", ret);
+        g_zfs_snap[0] = '\0';
+        return -1;
+    }
+
+    LOGI("ZFS snapshot created: %s", g_zfs_snap);
+    return 0;
+}
+
+// ===== FILE: ./update.c =====
+#include "update.h"
+#include "cfg.h"
+#include "log.h"
+#include "proc.h"
+#include "checks.h"
+#include "notify.h"
+#include "rollback.h"
+
+FILE *open_update_log(const char *backup_dir) {
+    if (g_dry_run) return NULL;
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s", backup_dir, UPDATE_LOG_NAME);
+    if (n < 0 || (size_t)n >= sizeof(path)) return NULL;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) { LOGW("Cannot create update.log: %s", strerror(errno)); return NULL; }
+    return fdopen(fd, "w");
+}
+
+int do_update_logged(FILE *logfp) {
+    LOGI("Running pacman -Syu");
+    char *argv[] = { PACMAN_BIN, "-Syu", "--noconfirm", NULL };
+    int ret = run_tee_mut(PACMAN_BIN, argv, logfp);
+    if (ret != 0) { LOGE("pacman -Syu exited with %d", ret); return -1; }
+    return 0;
+}
+
+int backup_versions_after(const char *backup_dir) {
+    char outfile[PATH_MAX];
+    int on = snprintf(outfile, sizeof(outfile), "%s/%s", backup_dir, VERSIONS_AFTER);
+    if (on < 0 || (size_t)on >= sizeof(outfile)) return -1;
+    if (g_dry_run) {
+        printf("  [DRY-RUN] would save: pacman -Q -> %s\n", outfile);
+        return 0;
+    }
+    char *argv[] = { PACMAN_BIN, "-Q", NULL };
+    if (run_to_file(PACMAN_BIN, argv, outfile) != 0) {
+        LOGW("Failed to save versions_after.txt");
+        return -1;
+    }
+    int fd = open(outfile, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { fsync(fd); close(fd); }
+    return 0;
+}
+
+static int try_rollback(const char *backup_dir, const char *reason) {
+    printf("\n  Triggering auto-rollback: %s\n", reason);
+    LOGI("Auto-rollback triggered: %s", reason);
+    int rc = do_rollback(backup_dir);
+    if (rc == 0) {
+        notify_send(NOTIFY_ROLLBACK_OK, backup_dir);
+        printf("\n  System rolled back to pre-update state.\n");
+    } else {
+        notify_send(NOTIFY_ROLLBACK_FAIL, "Manual recovery required");
+        printf("\n  Rollback failed. Follow the manual recovery guide:\n"
+               "    %s/%s\n", backup_dir, RECOVERY_FILE);
+    }
+    return rc;
+}
+
+int do_update_with_checks(const char *backup_dir, int auto_rollback) {
+    printf("\n==========================================\n");
+    printf("  RUNNING SYSTEM UPDATE%s\n", g_dry_run ? " [DRY-RUN]" : "");
+    printf("==========================================\n\n");
+
+    notify_send(NOTIFY_UPDATE_START, NULL);
+
+    FILE *logfp  = open_update_log(backup_dir);
+    int update_rc = do_update_logged(logfp);
+    if (logfp) { fflush(logfp); fclose(logfp); }
+
+    if (update_rc != 0) {
+        LOGE("Update failed (exit %d)", update_rc);
+        printf("\n  Update FAILED.\n");
+        notify_send(NOTIFY_UPDATE_FAIL, auto_rollback ? "Rolling back..." : NULL);
+
+        if (auto_rollback) {
+            int rb = try_rollback(backup_dir, "pacman -Syu failed");
+            return rb == 0 ? 1 : -1;
+        }
+
+        printf("  Auto-rollback is disabled.\n"
+               "  To roll back manually:  narch-rollback --last\n");
+        return -1;
+    }
+
+    LOGI("Update succeeded");
+    printf("\n  Update complete.\n");
+
+    backup_versions_after(backup_dir);
+
+    // A degraded state after update is treated as a rollback trigger
+    int sys_rc = check_systemctl_health();
+    if (sys_rc < 0 && auto_rollback) {
+        notify_send(NOTIFY_UPDATE_FAIL, "System in critical state after update");
+        int rb = try_rollback(backup_dir, "system entered critical state post-update");
+        return rb == 0 ? 1 : -1;
+    }
+
+    // If the kernel was updated but the image looks wrong, roll back
+    int kern_rc = check_kernel_update(backup_dir);
+    if (kern_rc != 0 && auto_rollback) {
+        notify_send(NOTIFY_UPDATE_FAIL, "Kernel install check failed");
+        int rb = try_rollback(backup_dir, "kernel install check failed");
+        return rb == 0 ? 1 : -1;
+    }
+
+    notify_send(NOTIFY_UPDATE_OK, NULL);
+    return 0;
+}
+
+// ===== FILE: ./utils.c =====
+#include "utils.h"
+#include "cfg.h"
+#include "log.h"
+#include "proc.h"
+
+unsigned long long free_bytes(const char *path) {
+    struct statvfs st;
+    if (statvfs(path, &st) != 0) return 0ULL;
+    return (unsigned long long)st.f_bsize * (unsigned long long)st.f_bavail;
+}
+
+int make_backup_path(char *buf, size_t size) {
+    time_t now = time(NULL);
+    struct tm tmbuf;
+    if (!localtime_r(&now, &tmbuf)) {
+        LOGE("localtime_r: %s", strerror(errno));
+        return -1;
+    }
+    int n = snprintf(buf, size, "%s/%04d-%02d-%02d_%02d-%02d-%02d",
+                     g_cfg.backup_base,
+                     tmbuf.tm_year + 1900, tmbuf.tm_mon + 1, tmbuf.tm_mday,
+                     tmbuf.tm_hour, tmbuf.tm_min, tmbuf.tm_sec);
+    if (n < 0 || (size_t)n >= size) { LOGE("Backup path too long"); return -1; }
+    return 0;
+}
+
+void make_timestamp(char *buf, size_t size) {
+    time_t now = time(NULL);
+    struct tm tmbuf;
+    if (!localtime_r(&now, &tmbuf))
+        snprintf(buf, size, "0000-00-00_00-00-00");
+    else
+        strftime(buf, size, "%Y-%m-%d_%H-%M-%S", &tmbuf);
+}
+
+int write_sentinel(const char *dir) {
+    if (g_dry_run) {
+        printf("  [DRY-RUN] would write sentinel: %s/%s\n", dir, SENTINEL_FILE);
+        return 0;
+    }
+    char path[PATH_MAX];
+    int pn = snprintf(path, sizeof(path), "%s/%s", dir, SENTINEL_FILE);
+    if (pn < 0 || (size_t)pn >= sizeof(path)) return -1;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) { LOGE("sentinel open: %s", strerror(errno)); return -1; }
+    time_t now = time(NULL);
+    struct tm tmbuf;
+    char ts[64] = "unknown";
+    if (localtime_r(&now, &tmbuf)) strftime(ts, sizeof(ts), "%F %T", &tmbuf);
+    char content[256];
+    int cn = snprintf(content, sizeof(content),
+                      "backup_complete=true\ntimestamp=%s\nversion=%s\n",
+                      ts, NS_VERSION);
+    if (cn > 0 && write(fd, content, (size_t)cn) != (ssize_t)cn)
+        LOGW("Partial sentinel write");
+    fsync(fd);
+    close(fd);
+    return 0;
+}
+
+void cleanup_partial_backup(const char *dir) {
+    if (!dir || dir[0] == '\0') return;
+    char sentinel[PATH_MAX];
+    int sn = snprintf(sentinel, sizeof(sentinel), "%s/%s", dir, SENTINEL_FILE);
+    if (sn < 0 || (size_t)sn >= sizeof(sentinel)) return;
+    // Only remove if the sentinel is absent — a complete backup is left alone
+    if (access(sentinel, F_OK) == 0) return;
+    LOGW("Removing incomplete backup: %s", dir);
+    char *argv[] = { RM_BIN, "-rf", "--", (char *)dir, NULL };
+    (void)run_mut(RM_BIN, argv);
+}
+
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+void cleanup_old_backups(void) {
+    DIR *d = opendir(g_cfg.backup_base);
+    if (!d) return;
+
+    char **names = NULL;
+    int count = 0, cap = 0;
+    struct dirent *ent;
+
+    while ((ent = readdir(d)) != NULL) {
+        // Backup dirs are named YYYY-MM-DD_HH-MM-SS, so they start with a digit
+        if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+        // Handle filesystems that don't populate d_type
+        if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
+        if (ent->d_type == DT_UNKNOWN) {
+            char tmp[PATH_MAX];
+            struct stat st;
+            if (snprintf(tmp, sizeof(tmp), "%s/%s", g_cfg.backup_base, ent->d_name) >= (int)sizeof(tmp)) continue;
+            if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        }
+        if (count >= cap) {
+            int nc = (cap == 0) ? 32 : cap * 2;
+            char **tmp = realloc(names, (size_t)nc * sizeof(char *));
+            if (!tmp) { LOGW("OOM in cleanup_old_backups"); break; }
+            names = tmp; cap = nc;
+        }
+        names[count] = strdup(ent->d_name);
+        if (names[count]) count++;
+    }
+    closedir(d);
+
+    if (count <= g_cfg.keep_count) goto done;
+
+    qsort(names, (size_t)count, sizeof(char *), cmp_str);
+
+    int to_del = count - g_cfg.keep_count;
+    LOGI("Pruning %d old backup(s)", to_del);
+    for (int i = 0; i < to_del; i++) {
+        char full[PATH_MAX];
+        int n = snprintf(full, sizeof(full), "%s/%s", g_cfg.backup_base, names[i]);
+        if (n < 0 || (size_t)n >= sizeof(full)) continue;
+        LOGI("  removing: %s", full);
+        char *argv[] = { RM_BIN, "-rf", "--", (char *)full, NULL };
+        (void)run_mut(RM_BIN, argv);
+    }
+
+done:
+    for (int i = 0; i < count; i++) free(names[i]);
+    free(names);
+}
+
+int find_last_backup(char *buf, size_t bufsz) {
+    DIR *d = opendir(g_cfg.backup_base);
+    if (!d) {
+        LOGE("Cannot open backup dir %s: %s", g_cfg.backup_base, strerror(errno));
+        return -1;
+    }
+
+    char best[NAME_MAX + 1] = {0};
+    struct dirent *ent;
+
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+        if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
+        if (ent->d_type == DT_UNKNOWN) {
+            char tmp[PATH_MAX];
+            struct stat st;
+            if (snprintf(tmp, sizeof(tmp), "%s/%s", g_cfg.backup_base, ent->d_name) >= (int)sizeof(tmp)) continue;
+            if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        }
+
+        // Only consider complete backups
+        char sentinel[PATH_MAX];
+        int sn = snprintf(sentinel, sizeof(sentinel), "%s/%s/%s",
+                          g_cfg.backup_base, ent->d_name, SENTINEL_FILE);
+        if (sn < 0 || (size_t)sn >= sizeof(sentinel)) continue;
+        if (access(sentinel, F_OK) != 0) continue;
+
+        if (strcmp(ent->d_name, best) > 0) {
+            size_t dlen = strnlen(ent->d_name, sizeof(best) - 1);
+            memset(best, 0, sizeof(best));
+            memcpy(best, ent->d_name, dlen);
+        }
+    }
+    closedir(d);
+
+    if (best[0] == '\0') {
+        LOGE("No complete backups found in %s", g_cfg.backup_base);
+        return -1;
+    }
+
+    int n = snprintf(buf, bufsz, "%s/%s", g_cfg.backup_base, best);
+    if (n < 0 || (size_t)n >= bufsz) return -1;
+    return 0;
+}
+

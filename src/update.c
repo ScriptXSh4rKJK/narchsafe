@@ -13,7 +13,9 @@ FILE *open_update_log(const char *backup_dir) {
     if (n < 0 || (size_t)n >= sizeof(path)) return NULL;
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) { LOGW("Cannot create update.log: %s", strerror(errno)); return NULL; }
-    return fdopen(fd, "w");
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); LOGW("fdopen update.log: %s", strerror(errno)); return NULL; }
+    return f;
 }
 
 int do_update_logged(FILE *logfp) {

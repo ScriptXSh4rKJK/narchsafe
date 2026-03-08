@@ -4,7 +4,9 @@
 #include "proc.h"
 
 int check_pacman_lock(void) {
-    if (access(PACMAN_DB_LOCK, F_OK) == 0) {
+    int fd = open(PACMAN_DB_LOCK, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
         LOGE("Stale pacman lock detected: %s\n"
              "       A previous session may have ended abnormally.\n"
              "       Remove it and retry:\n"
@@ -62,8 +64,11 @@ int check_systemctl_health(void) {
 
 static int kernel_was_updated(const char *backup_dir) {
     char before_path[PATH_MAX], after_path[PATH_MAX];
-    snprintf(before_path, sizeof(before_path), "%s/%s", backup_dir, VERSIONS_BEFORE);
-    snprintf(after_path,  sizeof(after_path),  "%s/%s", backup_dir, VERSIONS_AFTER);
+    int bn = snprintf(before_path, sizeof(before_path), "%s/%s", backup_dir, VERSIONS_BEFORE);
+    int an = snprintf(after_path,  sizeof(after_path),  "%s/%s", backup_dir, VERSIONS_AFTER);
+    if (bn < 0 || (size_t)bn >= sizeof(before_path) ||
+        an < 0 || (size_t)an >= sizeof(after_path))
+        return 0;
 
     FILE *fb = fopen(before_path, "r");
     FILE *fa = fopen(after_path,  "r");
@@ -74,12 +79,12 @@ static int kernel_was_updated(const char *backup_dir) {
     }
 
     typedef struct { char name[128]; char ver[128]; } KV;
-    KV *after = calloc(8192, sizeof(KV));
+    KV *after = calloc((size_t)MAX_PACKAGES, sizeof(KV));
     int nafter = 0;
     if (!after) { fclose(fb); fclose(fa); return 0; }
 
     char line[256];
-    while (fgets(line, (int)sizeof(line), fa) && nafter < 8192) {
+    while (fgets(line, (int)sizeof(line), fa) && nafter < MAX_PACKAGES) {
         char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
         if (sscanf(line, "%127s %127s", after[nafter].name, after[nafter].ver) == 2)
             nafter++;
@@ -143,13 +148,15 @@ int check_kernel_update(const char *backup_dir) {
     run_capture(UNAME_BIN, uname_argv, cap, sizeof(cap));
     if (cap[0]) {
         char moddir[PATH_MAX];
-        snprintf(moddir, sizeof(moddir), "/usr/lib/modules/%s", cap);
-        if (access(moddir, F_OK) == 0) {
-            printf("  Kernel modules found: %s\n", moddir);
-            LOGI("Kernel modules: %s", moddir);
-        } else {
-            printf("  Warning: module directory not found: %s\n", moddir);
-            LOGW("Module directory missing: %s", moddir);
+        int mn = snprintf(moddir, sizeof(moddir), "/usr/lib/modules/%s", cap);
+        if (mn > 0 && (size_t)mn < sizeof(moddir)) {
+            if (access(moddir, F_OK) == 0) {
+                printf("  Kernel modules found: %s\n", moddir);
+                LOGI("Kernel modules: %s", moddir);
+            } else {
+                printf("  Warning: module directory not found: %s\n", moddir);
+                LOGW("Module directory missing: %s", moddir);
+            }
         }
     }
 

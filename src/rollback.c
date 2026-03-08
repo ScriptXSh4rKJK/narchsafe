@@ -51,7 +51,15 @@ int do_rollback(const char *backup_dir) {
 
     char rblog_path[PATH_MAX];
     snprintf(rblog_path, sizeof(rblog_path), "%s/%s", backup_dir, ROLLBACK_LOG);
-    FILE *rblog = fopen(rblog_path, "w");
+    int rblog_fd = open(rblog_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    FILE *rblog = NULL;
+    if (rblog_fd >= 0) {
+        rblog = fdopen(rblog_fd, "w");
+        if (!rblog) {
+            close(rblog_fd);   /* fdopen failed — don't leak the fd */
+            LOGW("fdopen rollback log failed: %s", strerror(errno));
+        }
+    }
     if (rblog) {
         time_t now = time(NULL);
         struct tm tmbuf; char ts[64] = "";
@@ -151,8 +159,10 @@ int do_rollback(const char *backup_dir) {
 
     for (int i = 0; i < nbefore && (ndowngrade - 3) < MAX_ROLLBACK_PKGS; i++) {
         PkgInfo key;
-        strncpy(key.name, before[i].name, sizeof(key.name) - 1);
-        key.name[sizeof(key.name) - 1] = '\0';
+        memset(&key, 0, sizeof(key));
+        size_t nlen = strnlen(before[i].name, sizeof(key.name) - 1);
+        memcpy(key.name, before[i].name, nlen);
+        key.name[nlen] = '\0';
 
         PkgInfo *found = bsearch(&key, current, (size_t)ncurrent, sizeof(PkgInfo), cmp_pkg);
         int need_install = (!found || strcmp(found->ver, before[i].ver) != 0);
@@ -184,8 +194,10 @@ int do_rollback(const char *backup_dir) {
     // Packages installed during the update that did not exist before
     for (int i = 0; i < ncurrent && (nremove - 3) < MAX_ROLLBACK_PKGS; i++) {
         PkgInfo key;
-        strncpy(key.name, current[i].name, sizeof(key.name) - 1);
-        key.name[sizeof(key.name) - 1] = '\0';
+        memset(&key, 0, sizeof(key));
+        size_t nlen = strnlen(current[i].name, sizeof(key.name) - 1);
+        memcpy(key.name, current[i].name, nlen);
+        key.name[nlen] = '\0';
         PkgInfo *found = bsearch(&key, before, (size_t)nbefore, sizeof(PkgInfo), cmp_pkg);
         if (!found) {
             remove_argv[nremove++] = current[i].name;
@@ -238,6 +250,8 @@ int do_rollback(const char *backup_dir) {
     LOGI("=== Rollback finished (rc=%d) ===", rc);
     if (rblog) {
         fprintf(rblog, "rollback_rc=%d\nmissing_cache=%d\n", rc, missing_cache);
+        fflush(rblog);
+        fsync(fileno(rblog));
         fclose(rblog);
     }
     return rc;

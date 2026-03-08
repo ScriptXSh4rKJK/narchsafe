@@ -85,7 +85,14 @@ void cleanup_old_backups(void) {
     while ((ent = readdir(d)) != NULL) {
         // Backup dirs are named YYYY-MM-DD_HH-MM-SS, so they start with a digit
         if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
-        if (ent->d_type != DT_DIR) continue;
+        // Handle filesystems that don't populate d_type
+        if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
+        if (ent->d_type == DT_UNKNOWN) {
+            char tmp[PATH_MAX];
+            struct stat st;
+            if (snprintf(tmp, sizeof(tmp), "%s/%s", g_cfg.backup_base, ent->d_name) >= (int)sizeof(tmp)) continue;
+            if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        }
         if (count >= cap) {
             int nc = (cap == 0) ? 32 : cap * 2;
             char **tmp = realloc(names, (size_t)nc * sizeof(char *));
@@ -129,7 +136,13 @@ int find_last_backup(char *buf, size_t bufsz) {
 
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
-        if (ent->d_type != DT_DIR) continue;
+        if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
+        if (ent->d_type == DT_UNKNOWN) {
+            char tmp[PATH_MAX];
+            struct stat st;
+            if (snprintf(tmp, sizeof(tmp), "%s/%s", g_cfg.backup_base, ent->d_name) >= (int)sizeof(tmp)) continue;
+            if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        }
 
         // Only consider complete backups
         char sentinel[PATH_MAX];

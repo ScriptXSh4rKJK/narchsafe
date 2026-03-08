@@ -10,7 +10,10 @@ int create_backup_dir(const char *dir) {
         LOGE("Failed to create base dir: %s", g_cfg.backup_base);
         return -1;
     }
-    if (!g_dry_run) chmod(g_cfg.backup_base, 0700);
+    if (!g_dry_run) {
+        if (chmod(g_cfg.backup_base, 0700) != 0)
+            LOGW("chmod(%s, 0700): %s", g_cfg.backup_base, strerror(errno));
+    }
     if (g_dry_run) {
         printf("  [DRY-RUN] would mkdir: %s\n", dir);
         return 0;

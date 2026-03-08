@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.2.0] - 2025-03-08
+## [1.2.0] - 2026-03-08
 
 ### Fixed — Security
 - **`proc.c`** — `pipe()` replaced with `pipe2(O_CLOEXEC)` in `run_tee` and `run_capture` to prevent pipe file-descriptor leaks into child processes across `fork`+`exec`
@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Version bumped to `1.2.0`
 - `etc/narchsafe.conf` fully rewritten with step-by-step Telegram setup instructions and clearer comments for every option
 
-## [1.1.0] - 2025-02-01
+## [1.1.0] - 2026-02-01
 
 ### Fixed
 - Telegram notification: chat_id and message now passed as separate `--data-urlencode` args (injection fix)
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `utils.c`: `cleanup_old_backups` and `find_last_backup` now handle `DT_UNKNOWN` via `stat()` fallback
 - Added compiler hardening flags: `-fstack-protector-strong -fPIE -pie -Wl,-z,relro,-z,now,-z,noexecstack`
 
-## [1.0.0] - 2025-01-01
+## [1.0.0] - 2026-01-01
 
 ### Added
 - Initial release: backup, update, rollback, Btrfs/ZFS snapshots, Telegram + libnotify notifications

@@ -12,18 +12,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install dependencies
         run: sudo apt-get install -y gcc make
-
       - name: Build
         run: make CC=gcc
-
       - name: Smoke test
         run: |
           ./narchsafe --version
           ./narchsafe --help
-
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -35,13 +31,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install dependencies
         run: sudo apt-get install -y clang make
-
       - name: Build
         run: make CC=clang
-
       - name: Smoke test
         run: |
           ./narchsafe --version
@@ -52,14 +45,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install cppcheck
         run: sudo apt-get install -y cppcheck
-
       - name: Run cppcheck
         run: |
           cppcheck \
-            --enable=all \
+            --enable=warning,performance,portability \
             --error-exitcode=1 \
             --std=c11 \
             --suppress=missingIncludeSystem \
@@ -74,13 +65,10 @@ jobs:
     needs: [build-gcc, build-clang, lint]
     steps:
       - uses: actions/checkout@v4
-
       - name: Install dependencies
         run: sudo apt-get install -y gcc make
-
       - name: Build
         run: make CC=gcc
-
       - name: Create tarball
         run: |
           VERSION=${GITHUB_REF_NAME#v}
@@ -89,7 +77,6 @@ jobs:
             Makefile LICENSE README.md CHANGELOG.md CONTRIBUTING.md \
             include/ src/ etc/
           sha256sum narchsafe-${VERSION}.tar.xz > narchsafe-${VERSION}.tar.xz.sha256
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

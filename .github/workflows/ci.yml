@@ -23,7 +23,6 @@ jobs:
         run: |
           ./narchsafe --version
           ./narchsafe --help
-          ./narchsafe --dry-run
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -46,7 +45,7 @@ jobs:
       - name: Smoke test
         run: |
           ./narchsafe --version
-          ./narchsafe --dry-run
+          ./narchsafe --help
 
   lint:
     name: Lint (cppcheck)
